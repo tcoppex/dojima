@@ -19,7 +19,14 @@
 
 #include <array>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <type_traits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -124,18 +131,6 @@ enum class BufferId : uint8_t {
   kCount
 };
 
-enum class AttributeId : uint8_t {
-  Position,
-  Texcoord,
-  Normal,
-  Tangent,
-  Joints,
-  Weights,
-  Binormal, //
-
-  kCount
-};
-
 // NIF node keys of interest.
 static std::string const kNiDataStreamKey{ "NiDataStream" };
 static std::string const kNiMeshKey{ "NiMesh" };
@@ -162,115 +157,53 @@ uint32_t GetPrimitiveType(Niflib::MeshPrimitiveType primType) {
   };
 }
 
-bool IsHalfPrecision(Niflib::ComponentFormat format) {
-  switch(format) {
-    case Niflib::F_FLOAT16_2:
-    case Niflib::F_FLOAT16_4:
+// ----------------------------------------------------------------------------
+//
+// NIF component formats encode their layout in the enum value :
+//    0x00CCSSTT  with CC = number of components, SS = bytes per component and
+//    TT = the data type (see Niflib::ComponentFormat).
+//
+// ----------------------------------------------------------------------------
+
+inline int FormatNumComponents(Niflib::ComponentFormat f) {
+  return (static_cast<int>(f) >> 16) & 0xff;
+}
+
+inline size_t FormatByteSize(Niflib::ComponentFormat f) {
+  return static_cast<size_t>(FormatNumComponents(f)) *
+         static_cast<size_t>((static_cast<int>(f) >> 8) & 0xff);
+}
+
+// Decode one element of a vertex attribute to (at most 4) floats.
+// Returns false for unsupported formats.
+bool DecodeFormat(Niflib::ComponentFormat f, uint8_t const* src, float out[4]) {
+  int const n = FormatNumComponents(f);
+  int const type = static_cast<int>(f) & 0xff;
+  if (n < 1 || n > 4) {
+    return false;
+  }
+
+  auto load = [&](auto const* p, auto fn) {
+    using T = std::remove_cv_t<std::remove_pointer_t<decltype(p)>>;
+    for (int i = 0; i < n; ++i) {
+      T v;
+      std::memcpy(&v, src + i * sizeof(T), sizeof(T));
+      out[i] = fn(v);
+    }
     return true;
-
-    default:
-    return false;
   };
-}
 
-size_t SetAccessorFormat(Niflib::ComponentFormat format, tinygltf::Accessor *accessor) {
-
-  // Notes :
-  // glTF 2.0 does not support half precision floating point buffer natively so we
-  // either have to define an extension / pack them as uint (lacking portability)
-  // or we can just convert the buffer as 32bit floating point (at the cost of
-  // doubling the buffer size).
-  //
-  // Here fp16 data are "wrongly" typed as fp32, while conversion checking
-  // should be performed on the VertexBuffer's BufferView side.
-  //
-  //  We set an accessor type depending on the input format but which might
-  //  not comply with glTF standard for a given attribute target, therefore it
-  // might change afterwards when calling ::SetAttribute.
-  //
-
-  switch(format) {
-    case Niflib::F_UINT16_1:
-      accessor->componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
-      accessor->type = TINYGLTF_TYPE_SCALAR;
-    return 1 * sizeof(uint16_t);
-
-    case Niflib::F_FLOAT16_2: //
-    case Niflib::F_FLOAT32_2:
-      accessor->componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
-      accessor->type = TINYGLTF_TYPE_VEC2;
-    return 2 * sizeof(float);
-
-    case Niflib::F_FLOAT16_4: //
-    case Niflib::F_FLOAT32_4:
-      accessor->componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
-      accessor->type = TINYGLTF_TYPE_VEC4;
-    return 4 * sizeof(float);
-
-    case Niflib::F_FLOAT32_3:
-      accessor->componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
-      accessor->type = TINYGLTF_TYPE_VEC3;
-    return 3 * sizeof(float);
-
-    case Niflib::F_UINT8_4:
-      accessor->componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
-      accessor->type = TINYGLTF_TYPE_VEC4;
-    return 4 * sizeof(uint8_t);
-
-    default:
-      DOJIMA_QUIET_LOG( "[Warning] " << __FUNCTION__ << " : unsupported format " << format << "." );
-    return 0;
-  };
-}
-
-bool SetAttribute(Niflib::SemanticData cs, size_t accessorIndex, tinygltf::Primitive *prim, tinygltf::Accessor *accessor) {
-  std::string const& name = cs.name;
-  std::string const suffix{std::to_string(cs.index)};
-
-  // DOJIMA_QUIET_LOG( "setting attribute " << name );
-
-  if ((name == "POSITION") || (name == "POSITION_BP")) {
-    prim->attributes["POSITION"] = accessorIndex;
-    accessor->type = TINYGLTF_TYPE_VEC3;
-    // [ should be defined for POSITION ]
-    // @see https://www.khronos.org/registry/glTF/specs/2.0/glTF-2.0.html#accessors-bounds
-    // auto &min_values = accessor->minValues;
-    // min_values.resize(3);
-    // auto &max_values = accessor->maxValues;
-    // max_values.resize(3);
-  }
-  else if ((name == "NORMAL") || (name == "NORMAL_BP")) {
-    prim->attributes["NORMAL"] = accessorIndex;
-    accessor->type = TINYGLTF_TYPE_VEC3;
-  }
-  else if (name == "TEXCOORD") {
-    prim->attributes["TEXCOORD_" + suffix] = accessorIndex;
-    accessor->type = TINYGLTF_TYPE_VEC2;
-  }
-  else if (name == "BLENDINDICES") {
-    prim->attributes["JOINTS_" + suffix] = accessorIndex;
-    accessor->type = TINYGLTF_TYPE_VEC4;
-  }
-  else if (name == "BLENDWEIGHT") {
-    prim->attributes["WEIGHTS_" + suffix] = accessorIndex;
-    accessor->type = TINYGLTF_TYPE_VEC4;
-  }
-  // (invalid : glTF is expecting vec4 floating point for TANGENT where the buffer is vec3)
-  else if ((name == "TANGENT") || (name == "TANGENT_BP")) {
-    prim->attributes["TANGENT"] = accessorIndex;
-    accessor->type = TINYGLTF_TYPE_VEC4;
-    accessor->normalized = true; // (just here to prevent error display on validation)
-  }
-  // (not natively supported by glTF, here to prevent preprocessing the vertex buffer)
-  else if ((name == "BINORMAL") || (name == "BINORMAL_BP")) {
-    prim->attributes["_BINORMAL"] = accessorIndex;
-  }
-  else {
-    DOJIMA_QUIET_LOG( "[Warning] " << __FUNCTION__ << " : " << name << " component not used." );
-    return false;
-  }
-
-  return true;
+  if (type >= 0x01 && type <= 0x04) return load((int8_t const*)0, [](int8_t v) { return float(v); });
+  if (type >= 0x05 && type <= 0x08) return load((uint8_t const*)0, [](uint8_t v) { return float(v); });
+  if (type >= 0x09 && type <= 0x0C) return load((int8_t const*)0, [](int8_t v) { return std::max(float(v) / 127.0f, -1.0f); });
+  if (type >= 0x0D && type <= 0x10) return load((uint8_t const*)0, [](uint8_t v) { return float(v) / 255.0f; });
+  if (type >= 0x11 && type <= 0x14) return load((int16_t const*)0, [](int16_t v) { return float(v); });
+  if (type >= 0x15 && type <= 0x18) return load((uint16_t const*)0, [](uint16_t v) { return float(v); });
+  if (type >= 0x19 && type <= 0x1C) return load((int16_t const*)0, [](int16_t v) { return std::max(float(v) / 32767.0f, -1.0f); });
+  if (type >= 0x1D && type <= 0x20) return load((uint16_t const*)0, [](uint16_t v) { return float(v) / 65535.0f; });
+  if (type >= 0x31 && type <= 0x34) return load((half const*)0, [](half v) { return static_cast<float>(v); });
+  if (type >= 0x35 && type <= 0x38) return load((float const*)0, [](float v) { return v; });
+  return false;
 }
 
 } // namespace ""
@@ -463,36 +396,65 @@ int main(int argc, char *argv[]) {
   // ImageBuffer.name = "Images";
   // ImageBuffer.data.reserve(imagesBytesize); //
 
-  // Offset to current buffers' end, used to build buffer viewers.
-  size_t indexBufferOffset = 0;
-  size_t vertexBufferOffset = 0;
-  // size_t imageBufferOffset = 0;
-
   // Retrieve the number of NIF mesh nodes.
   size_t const kNiMeshCount{ getNumBlocks(kNiMeshKey) };
-
-  // Calculate the total number of submeshes.
-  size_t totalSubmeshesCount{ 0 };
-  {
-    auto const& meshIndices = getTypeListIndices( kNiMeshKey );
-    for (auto mesh_id : meshIndices) {
-      Niflib::NiObject *obj = nifList[mesh_id];
-      Niflib::NiMesh* nifMesh = (Niflib::NiMesh*)obj;
-      totalSubmeshesCount += nifMesh->GetNumSubmeshes();
-    }
-  }
 
   // Meshes buffers.
   std::vector<tinygltf::Mesh> Meshes( kNiMeshCount );
 
-  // BufferViews buffers.
-  size_t const kNumBufferViews = Buffers.size() * kNiMeshCount; //
-  std::vector<tinygltf::BufferView> BufferViews( kNumBufferViews );
+  // BufferViews and Accessors are appended as they get created.
+  std::vector<tinygltf::BufferView> BufferViews;
+  std::vector<tinygltf::Accessor> Accessors;
 
-  // Submeshes buffers.
-  size_t const kNumAttributes = static_cast<size_t>(AttributeId::kCount); // (might be lower)
-  size_t constexpr kNumAccessorPerSubmesh{ 1 + kNumAttributes };
-  std::vector<tinygltf::Accessor> Accessors( totalSubmeshesCount * kNumAccessorPerSubmesh ); // ..
+  // [lambda] Append bytes to a buffer (4 bytes aligned), create the matching
+  // bufferView and return its index.
+  auto addBufferView{
+    [&](BufferId bufferId, void const* bytes, size_t bytesize, int target) -> int {
+      auto &buffer = Buffers[static_cast<size_t>(bufferId)];
+      buffer.data.resize((buffer.data.size() + 3u) & ~size_t(3));
+
+      tinygltf::BufferView bv;
+      bv.buffer = static_cast<int>(bufferId);
+      bv.byteOffset = buffer.data.size();
+      bv.byteLength = bytesize;
+      bv.target = target;
+
+      auto const* src = static_cast<uint8_t const*>(bytes);
+      buffer.data.insert(buffer.data.end(), src, src + bytesize);
+      BufferViews.push_back(bv);
+      return static_cast<int>(BufferViews.size()) - 1;
+    }
+  };
+
+  // [lambda] Create a tightly packed float attribute accessor from a vector of
+  // floats, and returns its index.
+  auto addFloatAccessor{
+    [&](std::string const& name, std::vector<float> const& values, int type, int numComps, bool bounds) -> int {
+      size_t const count = values.size() / numComps;
+
+      tinygltf::Accessor acc;
+      acc.name = kNameAccessors ? name : "";
+      acc.bufferView = addBufferView(BufferId::VERTEX, values.data(), values.size() * sizeof(float), TINYGLTF_TARGET_ARRAY_BUFFER);
+      acc.byteOffset = 0;
+      acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+      acc.type = type;
+      acc.count = count;
+
+      if (bounds && (count > 0)) {
+        acc.minValues.assign(numComps,  std::numeric_limits<double>::max());
+        acc.maxValues.assign(numComps, -std::numeric_limits<double>::max());
+        for (size_t i = 0; i < count; ++i) {
+          for (int c = 0; c < numComps; ++c) {
+            double const v = values[i * numComps + c];
+            acc.minValues[c] = std::min(acc.minValues[c], v);
+            acc.maxValues[c] = std::max(acc.maxValues[c], v);
+          }
+        }
+      }
+      Accessors.push_back(acc);
+      return static_cast<int>(Accessors.size()) - 1;
+    }
+  };
 
   // Materials buffer.
   // Depends on textures, MaterialData & NiMaterialProperty.
@@ -503,9 +465,7 @@ int main(int argc, char *argv[]) {
   std::vector<tinygltf::Sampler> Samplers( 1 ); //
   // std::map< uint16_t, size_t > mapTexDescFlagToSamplerIndex;
 
-  // Index to available buffer slot.
-  size_t current_buffer_view = 0;
-  size_t current_accessor = 0;
+  // Index to available material slot.
   size_t current_material = 0; //
 
   // -- Texture extraction helpers.
@@ -767,147 +727,197 @@ int main(int argc, char *argv[]) {
     // Primitives / submeshes.
     uint32_t const nsubmeshes = nifMesh->GetNumSubmeshes();
     mesh.primitives.resize(nsubmeshes);
+    for (auto &prim : mesh.primitives) {
+      prim.mode = primType;
+      prim.material = meshMaterialIndex; // (same as current niMesh)
+    }
 
-    // Create a buffer_view for each used datastream.
-    uint32_t numMeshdata = 0;
     for (auto const& md : nifMesh->GetMeshDatas()) {
       auto const& stream = md.stream;
-      auto const& usage = stream->GetUsage();
+      auto const usage = stream->GetUsage();
 
-      // Bypass unused meshData.
-      if ((usage == Niflib::USAGE_SHADER_CONSTANT) ||
-          (usage == Niflib::USAGE_USER)) {
-        // DOJIMA_QUIET_LOG( "[Warning] A " << usage << " MeshData was not used." );
+      // Bypass unused meshData (USAGE_USER holds the BONE_PALETTE).
+      if ((usage != Niflib::USAGE_VERTEX_INDEX) && (usage != Niflib::USAGE_VERTEX)) {
         continue;
       }
 
-      if (++numMeshdata > static_cast<uint32_t>(BufferId::kCount)) {
-        DOJIMA_QUIET_LOG( "[Warning] An exceeding amount of internal buffers has been found." );
-        break;
-      }
-
-      // -- BUFFER VIEW.
-
-      int const bufferViewIndex = current_buffer_view++;
-      auto &bufferView = BufferViews.at(bufferViewIndex);
-
-      bufferView.byteLength = stream->GetNumBytes();
       auto const& data = stream->GetData();
       auto const& formats = stream->GetComponentFormats();
-
-      switch (usage) {
-        case Niflib::USAGE_VERTEX_INDEX:
-          bufferView.target = TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER;
-          bufferView.buffer = (int)BufferId::INDEX;
-          bufferView.byteOffset = indexBufferOffset;
-          bufferView.byteStride = 0;
-
-          IndexBuffer.data.insert(IndexBuffer.data.end(), data.cbegin(), data.cend());
-          indexBufferOffset += bufferView.byteLength;
-        break;
-
-        case Niflib::USAGE_VERTEX:
-        {
-          bufferView.target = TINYGLTF_TARGET_ARRAY_BUFFER;
-          bufferView.buffer = (int)BufferId::VERTEX;
-          bufferView.byteOffset = vertexBufferOffset;
-          bufferView.byteStride = 0;
-
-          // Calculate the interleaved attributes bytestride.
-          tinygltf::Accessor dummy_accessor;
-          int numHalfPrecisionBuffers = 0;
-          for (auto const format : formats) {
-            numHalfPrecisionBuffers += IsHalfPrecision(format) ? 1 : 0;
-            size_t const byteSize = SetAccessorFormat(format, &dummy_accessor);
-            bufferView.byteStride += byteSize; // [as fp32 values]
-          }
-
-          if (0 == numHalfPrecisionBuffers) {
-            VertexBuffer.data.insert(VertexBuffer.data.end(), data.cbegin(), data.cend());
-          } else if (numHalfPrecisionBuffers == md.numComponents) {
-            // We handle half precision buffer conversion only when all the attributes
-            // in the buffer are half-precision.
-
-            // Converts the half-precision floating point buffer to single precision.
-            half const* fp16_buffer = reinterpret_cast<half const*>(data.data());
-            std::vector<float> fp32_buffer(data.size() / 2);
-            for (size_t i = 0; i < fp32_buffer.size(); ++i) {
-              fp32_buffer[i] = static_cast<float>(fp16_buffer[i]);
-            }
-            auto bytes = reinterpret_cast<uint8_t const*>(fp32_buffer.data());
-            VertexBuffer.data.insert(VertexBuffer.data.end(), bytes, bytes + sizeof(float) * fp32_buffer.size());
-
-            bufferView.byteLength *= 2;
-          } else {
-            DOJIMA_QUIET_LOG( "[Warning] Sparsed half precision buffers are not supported ." );
-          }
-
-          vertexBufferOffset += bufferView.byteLength;
-        }
-        break;
-
-        default:
-            DOJIMA_QUIET_LOG( "[Warning] unused DataStreamUsage found ." );
-        break;
-      };
-
-      // -- Submeshes ACCESSORs.
-
       auto const& regions = stream->GetRegions();
+
+      // -- Indices : the stream is copied as is, each submesh has an accessor
+      //    to its region.
+      if (usage == Niflib::USAGE_VERTEX_INDEX) {
+        int const bufferView = addBufferView(BufferId::INDEX, data.data(), data.size(), TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER);
+
+        size_t const byteSize = FormatByteSize(formats[0]);
+        int const componentType = (byteSize == sizeof(uint32_t)) ? TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT
+                                                                  : TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+        for (uint32_t submesh_id = 0; submesh_id < nsubmeshes; ++submesh_id) {
+          auto const& region = regions[md.submeshToRegionMap[submesh_id]];
+
+          tinygltf::Accessor acc;
+          acc.name = kNameAccessors ? "INDEX" : "";
+          acc.bufferView = bufferView;
+          acc.byteOffset = region.startIndex * byteSize;
+          acc.componentType = componentType;
+          acc.type = TINYGLTF_TYPE_SCALAR;
+          acc.count = region.numIndices;
+
+          Accessors.push_back(acc);
+          mesh.primitives[submesh_id].indices = static_cast<int>(Accessors.size()) - 1;
+        }
+        continue;
+      }
+
+      // -- Vertices : attributes are decoded to float32 (NIF streams can be
+      //    interleaved, half-precision, or have a different layout than the one
+      //    glTF mandates) and repacked as one tight accessor per attribute and
+      //    per submesh.
+      size_t vertexStride = 0;
+      for (auto const format : formats) {
+        vertexStride += FormatByteSize(format);
+      }
 
       for (uint32_t submesh_id = 0; submesh_id < nsubmeshes; ++submesh_id) {
         auto &prim = mesh.primitives[submesh_id];
-        prim.mode = primType;
+        auto const& region = regions[md.submeshToRegionMap[submesh_id]];
 
-        // Material (same as current niMesh).
-        prim.material = meshMaterialIndex;
+        size_t const count = region.numIndices;
+        size_t const regionOffset = static_cast<size_t>(region.startIndex) * vertexStride;
+        if (regionOffset + count * vertexStride > data.size()) {
+          DOJIMA_QUIET_LOG( "[Warning] " << mesh.name << " : vertex region exceeds its data stream." );
+          continue;
+        }
 
-        // Creates accessors for each submeshes.
-        uint16_t const regionMapIndex = md.submeshToRegionMap[submesh_id];
-        auto const& region = regions[regionMapIndex];
+        // Decode each component of the stream.
+        struct Attribute_t {
+          std::vector<float> values; // always 4 floats per vertex.
+          int numComps = 0;
+        };
+        std::unordered_map<std::string, Attribute_t> attributes;
 
-        if (usage == Niflib::USAGE_VERTEX_INDEX) {
-          // -- Indices
+        size_t componentOffset = 0;
+        for (int comp_id = 0; comp_id < md.numComponents; ++comp_id) {
+          auto const format = formats[comp_id];
+          size_t const byteSize = FormatByteSize(format);
 
-          // Set the primitive indices accessor.
-          prim.indices = current_accessor++;
-
-          auto &acc = Accessors.at(prim.indices);
-          size_t const byteSize = SetAccessorFormat(formats[0], &acc);
-
-          if (kNameAccessors) {
-            acc.name = "INDEX";
+          std::string key{ md.componentSemantics[comp_id].name };
+          if (size_t const pos = key.rfind("_BP"); pos != std::string::npos) {
+            key.erase(pos); // (bind pose variants)
           }
-          acc.bufferView = bufferViewIndex;
-          acc.normalized = false;
-          acc.byteOffset = region.startIndex * byteSize;
-          acc.count = region.numIndices;
-        } else {
-          // -- Vertex attributes
+          key += std::to_string(md.componentSemantics[comp_id].index);
 
-          size_t vertexBaseOffset = region.startIndex * bufferView.byteStride;
-          for (int comp_id = 0; comp_id < md.numComponents; ++comp_id) {
-            auto const format = formats[comp_id];
-            auto const& sem = md.componentSemantics[comp_id];
+          Attribute_t attr;
+          attr.numComps = FormatNumComponents(format);
+          attr.values.assign(count * 4u, 0.0f);
 
-            int const accessorIndex = current_accessor++;
+          bool ok = true;
+          for (size_t i = 0; ok && (i < count); ++i) {
+            ok = DecodeFormat(format, data.data() + regionOffset + i * vertexStride + componentOffset, &attr.values[i * 4u]);
+          }
+          if (ok) {
+            attributes[key] = std::move(attr);
+          } else {
+            DOJIMA_QUIET_LOG( "[Warning] " << key << " : unsupported format " << format << "." );
+          }
+          componentOffset += byteSize;
+        }
 
-            // Set acc default params depending on format.
-            auto &acc = Accessors.at(accessorIndex);
-            size_t const byteSize = SetAccessorFormat(format, &acc);
-
-            // Set the primitive attribute accessor.
-            SetAttribute(sem, accessorIndex, &prim, &acc);
-
-            if (kNameAccessors) {
-              acc.name = sem.name;
+        // Returns the attribute repacked with `n` components, or nullptr.
+        auto getAttribute = [&](std::string const& key, int n, std::vector<float> *out) -> bool {
+          auto it = attributes.find(key);
+          if (it == attributes.end()) {
+            return false;
+          }
+          out->resize(count * n);
+          for (size_t i = 0; i < count; ++i) {
+            for (int c = 0; c < n; ++c) {
+              (*out)[i * n + c] = it->second.values[i * 4u + c];
             }
-            acc.bufferView = bufferViewIndex;
-            acc.byteOffset = vertexBaseOffset;
-            acc.count = region.numIndices;
-
-            vertexBaseOffset += byteSize; //
           }
+          return true;
+        };
+
+        std::vector<float> v;
+
+        if (getAttribute("POSITION0", 3, &v)) {
+          prim.attributes["POSITION"] = addFloatAccessor("POSITION", v, TINYGLTF_TYPE_VEC3, 3, true);
+        }
+        if (getAttribute("NORMAL0", 3, &v)) {
+          prim.attributes["NORMAL"] = addFloatAccessor("NORMAL", v, TINYGLTF_TYPE_VEC3, 3, false);
+        }
+        for (int set = 0; set < 8; ++set) {
+          if (getAttribute("TEXCOORD" + std::to_string(set), 2, &v)) {
+            auto const name = "TEXCOORD_" + std::to_string(set);
+            prim.attributes[name] = addFloatAccessor(name, v, TINYGLTF_TYPE_VEC2, 2, false);
+          }
+        }
+
+        // glTF expects a VEC4 tangent (xyz + handedness) and no binormal :
+        // the binormal is only used to recover the handedness.
+        if (std::vector<float> n, t, b; getAttribute("NORMAL0", 3, &n) && getAttribute("TANGENT0", 3, &t)) {
+          bool const hasBinormal = getAttribute("BINORMAL0", 3, &b);
+          v.assign(count * 4u, 1.0f);
+          for (size_t i = 0; i < count; ++i) {
+            float const* N = &n[i * 3u];
+            float const* T = &t[i * 3u];
+            v[i * 4u + 0] = T[0];
+            v[i * 4u + 1] = T[1];
+            v[i * 4u + 2] = T[2];
+            if (hasBinormal) {
+              float const* B = &b[i * 3u];
+              float const cx = N[1] * T[2] - N[2] * T[1];
+              float const cy = N[2] * T[0] - N[0] * T[2];
+              float const cz = N[0] * T[1] - N[1] * T[0];
+              v[i * 4u + 3] = (cx * B[0] + cy * B[1] + cz * B[2] < 0.0f) ? -1.0f : 1.0f;
+            }
+          }
+          prim.attributes["TANGENT"] = addFloatAccessor("TANGENT", v, TINYGLTF_TYPE_VEC4, 4, false);
+        }
+
+        // Skinning attributes.
+        //
+        // NIF stores 3 weights per vertex (the 4th is implicit) and the joint
+        // indices refer to the submesh BONE_PALETTE.
+        // [ TODO ] remap the joints through the bone palette once skins are exported.
+        if (auto itJ = attributes.find("BLENDINDICES0"), itW = attributes.find("BLENDWEIGHT0");
+            (itJ != attributes.end()) && (itW != attributes.end())) {
+          std::vector<uint16_t> joints(count * 4u);
+          std::vector<float> weights(count * 4u);
+
+          for (size_t i = 0; i < count; ++i) {
+            float const* j = &itJ->second.values[i * 4u];
+            float const* w = &itW->second.values[i * 4u];
+
+            float sum = 0.0f;
+            float ww[4];
+            for (int c = 0; c < 4; ++c) {
+              ww[c] = (c < itW->second.numComps) ? std::max(w[c], 0.0f) : 0.0f;
+              sum += ww[c];
+            }
+            if (itW->second.numComps == 3) {
+              ww[3] = std::max(1.0f - sum, 0.0f);
+              sum += ww[3];
+            }
+            for (int c = 0; c < 4; ++c) {
+              ww[c] = (sum > 0.0f) ? ww[c] / sum : ((c == 0) ? 1.0f : 0.0f);
+              weights[i * 4u + c] = ww[c];
+              // (glTF requires unused joints to have a null index)
+              joints[i * 4u + c] = (ww[c] > 0.0f) ? static_cast<uint16_t>(j[c]) : uint16_t(0);
+            }
+          }
+
+          tinygltf::Accessor accJ;
+          accJ.name = kNameAccessors ? "JOINTS_0" : "";
+          accJ.bufferView = addBufferView(BufferId::VERTEX, joints.data(), joints.size() * sizeof(uint16_t), TINYGLTF_TARGET_ARRAY_BUFFER);
+          accJ.componentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+          accJ.type = TINYGLTF_TYPE_VEC4;
+          accJ.count = count;
+          Accessors.push_back(accJ);
+          prim.attributes["JOINTS_0"] = static_cast<int>(Accessors.size()) - 1;
+
+          prim.attributes["WEIGHTS_0"] = addFloatAccessor("WEIGHTS_0", weights, TINYGLTF_TYPE_VEC4, 4, false);
         }
       } // -- end submeshes --
     } // -- end meshdatas --
@@ -1115,9 +1125,6 @@ int main(int argc, char *argv[]) {
 
   // std::cerr << "Nodes usage : " << Nodes.size() << " / " << Nodes.capacity()
   //           << std::endl;
-
-  // Remove excess size (happens when meshes do not have joints attributes).
-  Accessors.resize(current_accessor);
 
   tinygltf::Model data{};
   {
