@@ -11,7 +11,7 @@ All rights reserved.  Please see niflib.h for license. */
 #define _ATEXTURERENDERDATA_H_
 
 //--BEGIN FILE HEAD CUSTOM CODE--//
-
+#include <cstdint>
 //--END CUSTOM CODE--//
 
 #include "nif/obj/NiObject.h"
