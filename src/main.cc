@@ -29,6 +29,7 @@
 #include <type_traits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __GNUC__
@@ -206,6 +207,102 @@ bool DecodeFormat(Niflib::ComponentFormat f, uint8_t const* src, float out[4]) {
   if (type >= 0x31 && type <= 0x34) return load((half const*)0, [](half v) { return static_cast<float>(v); });
   if (type >= 0x35 && type <= 0x38) return load((float const*)0, [](float v) { return v; });
   return false;
+}
+
+// ----------------------------------------------------------------------------
+//  Minimal affine transform helpers (column-major 4x4, as glTF).
+// ----------------------------------------------------------------------------
+
+using Mat4 = std::array<double, 16>;
+
+Mat4 Identity() {
+  return { 1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1 };
+}
+
+Mat4 Mul(Mat4 const& a, Mat4 const& b) {
+  Mat4 r{};
+  for (int c = 0; c < 4; ++c) {
+    for (int row = 0; row < 4; ++row) {
+      double v = 0.0;
+      for (int k = 0; k < 4; ++k) {
+        v += a[k * 4 + row] * b[c * 4 + k];
+      }
+      r[c * 4 + row] = v;
+    }
+  }
+  return r;
+}
+
+// Inverse of an affine transform.
+Mat4 AffineInverse(Mat4 const& m) {
+  double const a = m[0], b = m[4], c = m[8];
+  double const d = m[1], e = m[5], f = m[9];
+  double const g = m[2], h = m[6], i = m[10];
+  double const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  double const inv = (std::abs(det) > 1e-30) ? 1.0 / det : 0.0;
+
+  // (row, column) = inverse of the upper 3x3.
+  double r[3][3] = {
+    { (e * i - f * h) * inv, (c * h - b * i) * inv, (b * f - c * e) * inv },
+    { (f * g - d * i) * inv, (a * i - c * g) * inv, (c * d - a * f) * inv },
+    { (d * h - e * g) * inv, (b * g - a * h) * inv, (a * e - b * d) * inv },
+  };
+  Mat4 o = Identity();
+  for (int col = 0; col < 3; ++col) {
+    for (int row = 0; row < 3; ++row) {
+      o[col * 4 + row] = r[row][col];
+    }
+  }
+  for (int row = 0; row < 3; ++row) {
+    o[12 + row] = -(r[row][0] * m[12] + r[row][1] * m[13] + r[row][2] * m[14]);
+  }
+  return o;
+}
+
+Mat4 FromTRS(tinygltf::Node const& n) {
+  Mat4 m = Identity();
+  double x = 0, y = 0, z = 0, w = 1;
+  if (n.rotation.size() == 4) { x = n.rotation[0]; y = n.rotation[1]; z = n.rotation[2]; w = n.rotation[3]; }
+  double sx = 1, sy = 1, sz = 1;
+  if (n.scale.size() == 3) { sx = n.scale[0]; sy = n.scale[1]; sz = n.scale[2]; }
+  m[0]  = (1 - 2 * (y * y + z * z)) * sx;  m[1]  = (2 * (x * y + z * w)) * sx;      m[2]  = (2 * (x * z - y * w)) * sx;
+  m[4]  = (2 * (x * y - z * w)) * sy;      m[5]  = (1 - 2 * (x * x + z * z)) * sy;  m[6]  = (2 * (y * z + x * w)) * sy;
+  m[8]  = (2 * (x * z + y * w)) * sz;      m[9]  = (2 * (y * z - x * w)) * sz;      m[10] = (1 - 2 * (x * x + y * y)) * sz;
+  if (n.translation.size() == 3) { m[12] = n.translation[0]; m[13] = n.translation[1]; m[14] = n.translation[2]; }
+  return m;
+}
+
+// Decompose an affine transform to the node's translation / rotation / scale.
+void SetTRS(Mat4 const& m, tinygltf::Node *n) {
+  n->translation = { m[12], m[13], m[14] };
+
+  double s[3];
+  for (int c = 0; c < 3; ++c) {
+    s[c] = std::sqrt(m[c*4]*m[c*4] + m[c*4+1]*m[c*4+1] + m[c*4+2]*m[c*4+2]);
+    if (s[c] < 1e-12) s[c] = 1.0;
+  }
+  n->scale = { s[0], s[1], s[2] };
+
+  double const r00 = m[0] / s[0], r10 = m[1] / s[0], r20 = m[2] / s[0];
+  double const r01 = m[4] / s[1], r11 = m[5] / s[1], r21 = m[6] / s[1];
+  double const r02 = m[8] / s[2], r12 = m[9] / s[2], r22 = m[10] / s[2];
+
+  double x, y, z, w;
+  if (double const tr = r00 + r11 + r22; tr > 0.0) {
+    double const k = std::sqrt(tr + 1.0) * 2.0;
+    w = 0.25 * k; x = (r21 - r12) / k; y = (r02 - r20) / k; z = (r10 - r01) / k;
+  } else if ((r00 > r11) && (r00 > r22)) {
+    double const k = std::sqrt(1.0 + r00 - r11 - r22) * 2.0;
+    w = (r21 - r12) / k; x = 0.25 * k; y = (r01 + r10) / k; z = (r02 + r20) / k;
+  } else if (r11 > r22) {
+    double const k = std::sqrt(1.0 + r11 - r00 - r22) * 2.0;
+    w = (r02 - r20) / k; x = (r01 + r10) / k; y = 0.25 * k; z = (r12 + r21) / k;
+  } else {
+    double const k = std::sqrt(1.0 + r22 - r00 - r11) * 2.0;
+    w = (r10 - r01) / k; x = (r02 + r20) / k; y = (r12 + r21) / k; z = 0.25 * k;
+  }
+  double const l = std::sqrt(x*x + y*y + z*z + w*w);
+  n->rotation = { x / l, y / l, z / l, w / l };
 }
 
 } // namespace ""
@@ -1003,65 +1100,116 @@ int main(int argc, char *argv[]) {
   }
 
 
+  // -- Shared skeleton.
+  //
+  // In a pack each part holds its own copy of the skeleton, and often only a
+  // partial one (the head part has no spine for instance) although the skinning
+  // data (bind poses) always refer to the complete rig. Rig nodes (the bones
+  // and their ancestors) are therefore merged by name, so that all the skins of
+  // a character share a single skeleton, which is also what the animations
+  // are targeting.
+  std::unordered_set<Niflib::NiAVObject const*> rigNodes;
+  for (auto const& obj : nifList) {
+    auto const nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(obj);
+    if (!nifMesh) {
+      continue;
+    }
+    for (auto const& modifier : nifMesh->GetModifiers()) {
+      auto const skinModifier = Niflib::DynamicCast<Niflib::NiSkinningMeshModifier>(modifier);
+      if (!skinModifier) {
+        continue;
+      }
+      for (Niflib::NiAVObject const* bone : skinModifier->GetBones()) {
+        for (Niflib::NiAVObject const* n = bone; n; n = n->GetParent()) {
+          rigNodes.insert(n);
+        }
+      }
+    }
+  }
+  std::unordered_map<std::string, int> mapRigNameToNode;
+
+  // The parts' rigs are partial : a bone missing its real parent is often
+  // attached to a farther ancestor ("main" for instance). When copies of a bone
+  // disagree we therefore keep the deepest parent, which is the real one.
+  std::unordered_map<std::string, std::pair<std::string, int>> rigBestParent;
+  for (auto const& obj : nifList) {
+    auto const nifNode = Niflib::DynamicCast<Niflib::NiAVObject>(obj);
+    if (!nifNode || (rigNodes.count(nifNode) == 0)) {
+      continue;
+    }
+    Niflib::NiAVObject* parent = nifNode->GetParent();
+    int depth = 0;
+    for (Niflib::NiAVObject const* n = parent; n; n = n->GetParent()) {
+      ++depth;
+    }
+    auto &best = rigBestParent[nifNode->GetName()];
+    if (parent && (depth > best.second)) {
+      best = { parent->GetName(), depth };
+    }
+  }
+  std::unordered_map<int, int> rigFallbackParent; // (node index to the index of its traversal parent)
+
   // [lambda] recursive function to fill the node hierarchy.
   std::function<void(tinygltf::Node *const, Niflib::NiAVObject *const, size_t *)> fillNodes{
     [&](tinygltf::Node *const parent, Niflib::NiAVObject *const nifAVO, size_t *mainTexId) -> void {
-      // [ test, skip empty nodes ]
-      // if (auto nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(nifAVO); !nifMesh) {
-      //   return;
-      // }
-
-      // Get a reference to a new node.
-      Nodes.push_back( tinygltf::Node() );
-      auto &node = Nodes.back();
-      mapNifToNode[nifAVO] = static_cast<int>(Nodes.size()) - 1;
-
-      // Set it as its parent's children.
-      if (parent) {
-        int const nodeIndex = static_cast<int>(Nodes.size()) - 1;
-        parent->children.push_back(nodeIndex);
-      }
-
-      node.name = nifAVO->GetName();
-
-      // auto nnn = Niflib::DynamicCast<Niflib::NiNode>(nifAVO);
-      // DOJIMA_LOG( mapNodeNameToId[node.name] // < " " << (nnn ? nnn->GetType().GetTypeName() : "")
-      //                                        << " " << node.name
-      //           );
-
-      auto const& qRotation = nifAVO->GetLocalRotation().AsQuaternion();
-      node.rotation = { (double)qRotation.x, (double)qRotation.y, (double)qRotation.z, (double)qRotation.w };
-
-      auto const fScale = static_cast<double>(nifAVO->GetLocalScale());
-      node.scale = { fScale, fScale, fScale };
-
-      auto const &vTranslation = nifAVO->GetLocalTranslation();
-      node.translation = { (double)vTranslation.x, (double)vTranslation.y, (double)vTranslation.z };
-
-      if (auto nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(nifAVO); nifMesh) {
-        node.mesh = mapMeshNameToId[node.name];
-        meshNodes.emplace_back(static_cast<int>(Nodes.size()) - 1, nifMesh);
-
-        if (mainTexId) {
-          auto &mat = Materials.at(mapMeshNameToMaterialId[node.name]);
-          mat.pbrMetallicRoughness.baseColorTexture.index = *mainTexId; //
+      // Rig nodes already created by a previous part are reused.
+      bool const isRigNode = (rigNodes.count(nifAVO) > 0);
+      int nodeIndex = -1;
+      if (isRigNode) {
+        if (auto it = mapRigNameToNode.find(nifAVO->GetName()); it != mapRigNameToNode.end()) {
+          nodeIndex = it->second;
         }
       }
 
-      // [ TODO ] Detect meshLOD node (nifSwitchNode).
-      // if (auto nifSwitchNode = Niflib::DynamicCast<Niflib::NiSwitchNode>(nifAVO); nifSwitchNode) {}
+      if (nodeIndex < 0) {
+        // Get a reference to a new node.
+        Nodes.push_back( tinygltf::Node() );
+        nodeIndex = static_cast<int>(Nodes.size()) - 1;
+        auto &node = Nodes.back();
 
-      // [ TODO ] Handle extra datas.
-      // auto const& listXD = nifAVO->GetExtraData();
-      // node.extras;
+        if (isRigNode) {
+          // (rig nodes are linked to their parent once all parts are processed)
+          mapRigNameToNode[nifAVO->GetName()] = nodeIndex;
+          rigFallbackParent[nodeIndex] = parent ? static_cast<int>(parent - Nodes.data()) : -1;
+        } else if (parent) {
+          // Set it as its parent's children.
+          parent->children.push_back(nodeIndex);
+        }
+
+        node.name = nifAVO->GetName();
+
+        auto const& qRotation = nifAVO->GetLocalRotation().AsQuaternion();
+        node.rotation = { (double)qRotation.x, (double)qRotation.y, (double)qRotation.z, (double)qRotation.w };
+
+        auto const fScale = static_cast<double>(nifAVO->GetLocalScale());
+        node.scale = { fScale, fScale, fScale };
+
+        auto const &vTranslation = nifAVO->GetLocalTranslation();
+        node.translation = { (double)vTranslation.x, (double)vTranslation.y, (double)vTranslation.z };
+
+        if (auto nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(nifAVO); nifMesh) {
+          node.mesh = mapMeshNameToId[node.name];
+          meshNodes.emplace_back(nodeIndex, nifMesh);
+
+          if (mainTexId) {
+            auto &mat = Materials.at(mapMeshNameToMaterialId[node.name]);
+            mat.pbrMetallicRoughness.baseColorTexture.index = *mainTexId; //
+          }
+        }
+
+        // [ TODO ] Detect meshLOD node (nifSwitchNode).
+        // if (auto nifSwitchNode = Niflib::DynamicCast<Niflib::NiSwitchNode>(nifAVO); nifSwitchNode) {}
+
+        // [ TODO ] Handle extra datas.
+        // auto const& listXD = nifAVO->GetExtraData();
+        // node.extras;
+      }
+      mapNifToNode[nifAVO] = nodeIndex;
 
       // Continue processing if the nif object is a pure node (and not only a leaf).
       if (auto nifNode = Niflib::DynamicCast<Niflib::NiNode>(nifAVO); nifNode) {
-        if (nifNode->IsSkeletonRoot()) {
-          // node.skin;
-        }
         for (auto &child : nifNode->GetChildren()) {
-          fillNodes(&node, child, mainTexId);
+          fillNodes(&Nodes[nodeIndex], child, mainTexId);
         }
       }
     }
@@ -1108,8 +1256,32 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // Append the node part to the nodes hierarchy.
+    // Parts are processed from the one with the most complete rig, so shared
+    // rig nodes get their parent from the full skeleton and the other parts
+    // only add what they define on top of it (e.g. facial bones).
+    std::function<size_t(Niflib::NiAVObject const*)> countRigNodes{
+      [&](Niflib::NiAVObject const* n) -> size_t {
+        size_t count = rigNodes.count(n);
+        if (auto nifNode = Niflib::DynamicCast<Niflib::NiNode>(n); nifNode) {
+          for (auto &child : nifNode->GetChildren()) {
+            count += countRigNodes(child);
+          }
+        }
+        return count;
+      }
+    };
+    std::vector<size_t> partOrder(nodeParts.size());
+    std::vector<size_t> partRigSize(nodeParts.size());
     for (size_t i = 0; i < nodeParts.size(); ++i) {
+      partOrder[i] = i;
+      partRigSize[i] = countRigNodes(Niflib::DynamicCast<Niflib::NiAVObject>(nifList[nodeParts[i].data_id]));
+    }
+    std::stable_sort(partOrder.begin(), partOrder.end(), [&](size_t a, size_t b) {
+      return partRigSize[a] > partRigSize[b];
+    });
+
+    // Append the node part to the nodes hierarchy.
+    for (size_t const i : partOrder) {
       // Geometry.
       auto const nodeId = nodeParts[i].data_id;
       auto upperNode = Niflib::StaticCast<Niflib::NiNode>(nifList[nodeId]);
@@ -1169,9 +1341,31 @@ int main(int argc, char *argv[]) {
   // std::cerr << "Nodes usage : " << Nodes.size() << " / " << Nodes.capacity()
   //           << std::endl;
 
+  // -- Link the shared rig nodes to their (deepest) parent.
+  {
+    std::vector<std::pair<int, std::string>> rigNodeList;
+    for (auto const& [name, index] : mapRigNameToNode) {
+      rigNodeList.emplace_back(index, name);
+    }
+    std::sort(rigNodeList.begin(), rigNodeList.end()); // (deterministic order)
+
+    for (auto const& [index, name] : rigNodeList) {
+      int parentIndex = rigFallbackParent[index];
+      if (auto it = rigBestParent.find(name); (it != rigBestParent.end()) && !it->second.first.empty()) {
+        if (auto pit = mapRigNameToNode.find(it->second.first); (pit != mapRigNameToNode.end()) && (pit->second != index)) {
+          parentIndex = pit->second;
+        }
+      }
+      if (parentIndex >= 0) {
+        Nodes[parentIndex].children.push_back(index);
+      }
+    }
+  }
+
   // -- Skins.
 
   std::vector<tinygltf::Skin> Skins;
+  std::unordered_map<int, Mat4> bindWorld; // (joint node index to its bind pose world transform)
   for (auto const& [nodeIndex, nifMesh] : meshNodes) {
     for (auto const& modifier : nifMesh->GetModifiers()) {
       auto const skinModifier = Niflib::DynamicCast<Niflib::NiSkinningMeshModifier>(modifier);
@@ -1213,6 +1407,12 @@ int main(int argc, char *argv[]) {
           inverseBindMatrices.push_back(0.0f);
         }
         inverseBindMatrices.insert(inverseBindMatrices.end(), { tr.translation.x, tr.translation.y, tr.translation.z, 1.0f });
+
+        if (bindWorld.count(it->second) == 0) {
+          Mat4 ibm;
+          std::copy(inverseBindMatrices.end() - 16, inverseBindMatrices.end(), ibm.begin());
+          bindWorld[it->second] = AffineInverse(ibm);
+        }
       }
       if (!valid || bones.empty()) {
         break;
@@ -1231,6 +1431,30 @@ int main(int argc, char *argv[]) {
       Nodes[nodeIndex].skin = static_cast<int>(Skins.size()) - 1;
       break; // (a mesh has a single skin)
     }
+  }
+
+  // -- Rest pose.
+  //
+  // The nodes of the partial rigs do not hold the real bind pose, so the rest
+  // pose of the bones is rebuilt from the skinning data : the skeleton then
+  // matches the inverse bind matrices, and the meshes appear unposed.
+  if (!Nodes.empty()) {
+    std::function<void(int, Mat4 const&)> bakeRestPose{
+      [&](int index, Mat4 const& parentWorld) -> void {
+        auto &node = Nodes[index];
+        Mat4 world;
+        if (auto it = bindWorld.find(index); it != bindWorld.end()) {
+          world = it->second;
+          SetTRS(Mul(AffineInverse(parentWorld), world), &node);
+        } else {
+          world = Mul(parentWorld, FromTRS(node));
+        }
+        for (int child : node.children) {
+          bakeRestPose(child, world);
+        }
+      }
+    };
+    bakeRestPose(0, Identity());
   }
 
   tinygltf::Model data{};
