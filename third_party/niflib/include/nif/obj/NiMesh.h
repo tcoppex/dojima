@@ -80,6 +80,10 @@ public:
 		return datas;
 	}
 
+	NIFLIB_API const vector<Ref<NiMeshModifier > > & GetModifiers() const {
+		return modifiers;
+	}
+
 	//--END CUSTOM CODE--//
 protected:
 	/*! The primitive type of the mesh, such as triangles or lines. */

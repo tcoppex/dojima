@@ -44,6 +44,8 @@
 #include "nif/gen/Header.h"
 #include "nif/obj/NiNode.h"
 #include "nif/obj/NiMesh.h"
+#include "nif/obj/NiMeshModifier.h"
+#include "nif/obj/NiSkinningMeshModifier.h"
 #include "nif/obj/NiDataStream.h"
 #include "nif/obj/NiSourceTexture.h"
 #include "nif/obj/NiPixelData.h"
@@ -732,6 +734,32 @@ int main(int argc, char *argv[]) {
       prim.material = meshMaterialIndex; // (same as current niMesh)
     }
 
+    // BONE_PALETTE : for each submesh, the list of skeleton bones (as indices to
+    // the skinning modifier's bones) its vertices' joints refer to.
+    Niflib::MeshData const* paletteData = nullptr;
+    for (auto const& md : nifMesh->GetMeshDatas()) {
+      if ((md.stream->GetUsage() == Niflib::USAGE_USER) && !md.componentSemantics.empty() &&
+          (std::string(md.componentSemantics[0].name) == "BONE_PALETTE")) {
+        paletteData = &md;
+        break;
+      }
+    }
+
+    // Returns the skeleton bone index of a submesh's palette entry.
+    auto remapJoint = [&](uint32_t submesh_id, uint16_t paletteIndex) -> uint16_t {
+      if (!paletteData) {
+        return paletteIndex;
+      }
+      auto const& region = paletteData->stream->GetRegions()[paletteData->submeshToRegionMap[submesh_id]];
+      if (paletteIndex >= region.numIndices) {
+        DOJIMA_QUIET_LOG( "[Warning] " << mesh.name << " : joint index out of its bone palette." );
+        return 0;
+      }
+      uint16_t bone;
+      std::memcpy(&bone, paletteData->stream->GetData().data() + (region.startIndex + paletteIndex) * sizeof(uint16_t), sizeof(uint16_t));
+      return bone;
+    };
+
     for (auto const& md : nifMesh->GetMeshDatas()) {
       auto const& stream = md.stream;
       auto const usage = stream->GetUsage();
@@ -879,8 +907,8 @@ int main(int argc, char *argv[]) {
         // Skinning attributes.
         //
         // NIF stores 3 weights per vertex (the 4th is implicit) and the joint
-        // indices refer to the submesh BONE_PALETTE.
-        // [ TODO ] remap the joints through the bone palette once skins are exported.
+        // indices refer to the submesh BONE_PALETTE, which we resolve here to
+        // indices in the skin's joints (the skinning modifier's bones).
         if (auto itJ = attributes.find("BLENDINDICES0"), itW = attributes.find("BLENDWEIGHT0");
             (itJ != attributes.end()) && (itW != attributes.end())) {
           std::vector<uint16_t> joints(count * 4u);
@@ -900,11 +928,18 @@ int main(int argc, char *argv[]) {
               ww[3] = std::max(1.0f - sum, 0.0f);
               sum += ww[3];
             }
+            // Snap residual weights (e.g. from the implicit 4th one) to zero, as
+            // glTF requires unused joints to have a null weight and a null index.
+            constexpr float kMinWeight = 1e-5f;
+            sum = 0.0f;
+            for (int c = 0; c < 4; ++c) {
+              ww[c] = (ww[c] < kMinWeight) ? 0.0f : ww[c];
+              sum += ww[c];
+            }
             for (int c = 0; c < 4; ++c) {
               ww[c] = (sum > 0.0f) ? ww[c] / sum : ((c == 0) ? 1.0f : 0.0f);
               weights[i * 4u + c] = ww[c];
-              // (glTF requires unused joints to have a null index)
-              joints[i * 4u + c] = (ww[c] > 0.0f) ? static_cast<uint16_t>(j[c]) : uint16_t(0);
+              joints[i * 4u + c] = (ww[c] > 0.0f) ? remapJoint(submesh_id, static_cast<uint16_t>(j[c])) : uint16_t(0);
             }
           }
 
@@ -955,6 +990,12 @@ int main(int argc, char *argv[]) {
 
   Nodes.reserve(totalNodeCount);
 
+  // NIF object to glTF node index, and the nodes holding a mesh (skins are
+  // created once the whole hierarchy is known, as bones might be visited after
+  // the meshes they influence).
+  std::unordered_map<Niflib::NiAVObject const*, int> mapNifToNode;
+  std::vector<std::pair<int, Niflib::Ref<Niflib::NiMesh>>> meshNodes;
+
   if (kUseRootNode) {
     Nodes.push_back({});
     root_node_ptr = &Nodes[0];
@@ -973,6 +1014,7 @@ int main(int argc, char *argv[]) {
       // Get a reference to a new node.
       Nodes.push_back( tinygltf::Node() );
       auto &node = Nodes.back();
+      mapNifToNode[nifAVO] = static_cast<int>(Nodes.size()) - 1;
 
       // Set it as its parent's children.
       if (parent) {
@@ -998,6 +1040,7 @@ int main(int argc, char *argv[]) {
 
       if (auto nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(nifAVO); nifMesh) {
         node.mesh = mapMeshNameToId[node.name];
+        meshNodes.emplace_back(static_cast<int>(Nodes.size()) - 1, nifMesh);
 
         if (mainTexId) {
           auto &mat = Materials.at(mapMeshNameToMaterialId[node.name]);
@@ -1126,6 +1169,70 @@ int main(int argc, char *argv[]) {
   // std::cerr << "Nodes usage : " << Nodes.size() << " / " << Nodes.capacity()
   //           << std::endl;
 
+  // -- Skins.
+
+  std::vector<tinygltf::Skin> Skins;
+  for (auto const& [nodeIndex, nifMesh] : meshNodes) {
+    for (auto const& modifier : nifMesh->GetModifiers()) {
+      auto const skinModifier = Niflib::DynamicCast<Niflib::NiSkinningMeshModifier>(modifier);
+      if (!skinModifier) {
+        continue;
+      }
+
+      tinygltf::Skin skin;
+      skin.name = nifMesh->GetName() + "_skin";
+
+      if (auto it = mapNifToNode.find(skinModifier->GetSkeletonRoot()); it != mapNifToNode.end()) {
+        skin.skeleton = it->second;
+      }
+
+      // The NIF bone transforms go from the skin (bind pose) space to each bone
+      // space, which are glTF's inverse bind matrices. (column-major 4x4)
+      // Note : NIF rotation matrices are stored transposed relatively to glTF.
+      auto const& bones = skinModifier->GetBones();
+      auto const& boneTransforms = skinModifier->GetBoneTransforms();
+      std::vector<float> inverseBindMatrices;
+      inverseBindMatrices.reserve(bones.size() * 16u);
+
+      bool valid = true;
+      for (size_t b = 0; b < bones.size(); ++b) {
+        auto it = mapNifToNode.find(bones[b]);
+        if (it == mapNifToNode.end()) {
+          DOJIMA_QUIET_LOG( "[Warning] " << nifMesh->GetName() << " : a skin bone is not part of the hierarchy." );
+          valid = false;
+          break;
+        }
+        skin.joints.push_back(it->second);
+
+        Niflib::SkinTransform const& tr = boneTransforms[b];
+        Niflib::Matrix33 rot = tr.rotation;
+        for (int col = 0; col < 3; ++col) {
+          for (int row = 0; row < 3; ++row) {
+            inverseBindMatrices.push_back(rot[col][row] * tr.scale);
+          }
+          inverseBindMatrices.push_back(0.0f);
+        }
+        inverseBindMatrices.insert(inverseBindMatrices.end(), { tr.translation.x, tr.translation.y, tr.translation.z, 1.0f });
+      }
+      if (!valid || bones.empty()) {
+        break;
+      }
+
+      tinygltf::Accessor acc;
+      acc.name = kNameAccessors ? "INVERSE_BIND_MATRICES" : "";
+      acc.bufferView = addBufferView(BufferId::VERTEX, inverseBindMatrices.data(), inverseBindMatrices.size() * sizeof(float), 0);
+      acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+      acc.type = TINYGLTF_TYPE_MAT4;
+      acc.count = bones.size();
+      Accessors.push_back(acc);
+      skin.inverseBindMatrices = static_cast<int>(Accessors.size()) - 1;
+
+      Skins.push_back(skin);
+      Nodes[nodeIndex].skin = static_cast<int>(Skins.size()) - 1;
+      break; // (a mesh has a single skin)
+    }
+  }
+
   tinygltf::Model data{};
   {
     data.asset.generator = "nif2gltf";
@@ -1144,7 +1251,7 @@ int main(int argc, char *argv[]) {
       data.samplers = std::move( Samplers );
     }
 
-    //data.skins;
+    data.skins = std::move( Skins );
     //data.animations;
     //data.cameras;
     //data.lights;
