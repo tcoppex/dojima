@@ -61,6 +61,20 @@ public:
 
 	//--BEGIN MISC CUSTOM CODE--//
 
+	NIFLIB_API unsigned short GetFlags() const { return flags; }
+
+	/*! The root bone of the skeleton. */
+	NIFLIB_API NiAVObject * GetSkeletonRoot() const { return skeletonRoot; }
+
+	/*! Transform from the root bone parent coordinate system to the skin's. */
+	NIFLIB_API const SkinTransform & GetSkeletonTransform() const { return skeletonTransform; }
+
+	/*! The bone nodes affecting this skin. */
+	NIFLIB_API const vector<NiAVObject * > & GetBones() const { return bones; }
+
+	/*! Transforms from the skin (bind pose) space to each bone space. */
+	NIFLIB_API const vector<SkinTransform > & GetBoneTransforms() const { return boneTransforms; }
+
 	//--END CUSTOM CODE--//
 protected:
 	/*!
