@@ -29,6 +29,10 @@ cmake --build BUILD/dojima
 
 # Run the cli converter.
 #./dojima/bin/nif2gltf $WOTS4_PATH/Common/Character/Model/Pack/Dojima01.nif
+
+# By default only the best LOD (LV1) of each character part is exported,
+# use --all-lods to keep them all.
+#./dojima/bin/nif2gltf --all-lods Dojima01.nif
 ```
 
 ### Acknowledgment
