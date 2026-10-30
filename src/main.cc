@@ -341,6 +341,25 @@ void SetAlphaMode(Niflib::NiAlphaProperty const& prop, tinygltf::Material *mater
   auto const func = prop.GetTestFunc();
   double const threshold = prop.GetTestThreshold() / 255.0;
 
+#if 1
+  switch (func) {
+    case AP::TF_LESS:
+      material->alphaMode = "BLEND";
+    break;
+
+    case AP::TF_GREATER:
+      // (some body parts have this flag set for no clear reasons, we might discard them)
+    case AP::TF_GEQUAL:
+      material->alphaMode = "MASK";
+      material->alphaCutoff = threshold;
+    break;
+
+    case AP::TF_ALWAYS:
+    default:
+      material->alphaMode = "OPAQUE";
+    break;
+  }
+#else
   if (test && (func == AP::TF_GEQUAL)) {
     material->alphaMode = "MASK";
     material->alphaCutoff = threshold;
@@ -352,6 +371,7 @@ void SetAlphaMode(Niflib::NiAlphaProperty const& prop, tinygltf::Material *mater
   } else {
     material->alphaMode = "OPAQUE";
   }
+#endif
 }
 
 } // namespace ""
