@@ -5,6 +5,7 @@
 // ----------------------------------------------------------------------------
 
 #include <cassert>
+#include <cctype>
 #include <cstdlib>
 #include <cstddef>
 
@@ -36,6 +37,7 @@
 #include "nif/gen/Header.h"
 #include "nif/obj/NiNode.h"
 #include "nif/obj/NiMesh.h"
+#include "nif/obj/NiSwitchNode.h"
 #include "nif/obj/NiMeshModifier.h"
 #include "nif/obj/NiSkinningMeshModifier.h"
 #include "nif/obj/NiDataStream.h"
@@ -107,6 +109,10 @@ static constexpr bool kGLTFEmbedImages = true;
 static constexpr bool kGLTFEmbedBuffers = true;
 static constexpr bool kGLTFPrettyPrint = true;
 static constexpr bool kGLTFWriteBinary = false;
+
+// Keep every LOD of the characters parts (see --all-lods), instead of only the
+// highest quality one.
+static bool gKeepAllLODs = false;
 
 // OS specific path separator.
 static constexpr char kSystemPathSeparator{
@@ -296,25 +302,82 @@ void SetTRS(Mat4 const& m, tinygltf::Node *n) {
   n->rotation = { x / l, y / l, z / l, w / l };
 }
 
+// Returns the level of a "LV<n>_" prefixed name (LV1 is the best), or -1.
+int ParseLODLevel(std::string const& name) {
+  if ((name.size() > 3) && (name[0] == 'L') && (name[1] == 'V') && std::isdigit(static_cast<unsigned char>(name[2]))) {
+    size_t pos = 2;
+    int level = 0;
+    while ((pos < name.size()) && std::isdigit(static_cast<unsigned char>(name[pos]))) {
+      level = level * 10 + (name[pos++] - '0');
+    }
+    if ((pos < name.size()) && (name[pos] == '_')) {
+      return level;
+    }
+  }
+  return -1;
+}
+
+// Basename of a path (either separator style), without its extension.
+std::string FileStem(std::string const& path) {
+  size_t const start = path.find_last_of("/\\");
+  std::string name = path.substr((start == std::string::npos) ? 0 : start + 1);
+  if (size_t const dot = name.find_last_of('.'); dot != std::string::npos) {
+    name.erase(dot);
+  }
+  return name;
+}
+
+// Convert a NiAlphaProperty to a glTF alpha mode.
+//
+// WotS4 draws characters' hair and lashes in two passes : an alpha tested one
+// (GEQUAL 255 : the opaque texels) and an alpha blended one (LESS 255 : the
+// remaining ones). Skin & clothes only enable the blending.
+void SetAlphaMode(Niflib::NiAlphaProperty const& prop, tinygltf::Material *material) {
+  using AP = Niflib::NiAlphaProperty;
+  bool const blend = prop.GetBlendState();
+  bool const test = prop.GetTestState();
+  auto const func = prop.GetTestFunc();
+  double const threshold = prop.GetTestThreshold() / 255.0;
+
+  if (test && (func == AP::TF_GEQUAL)) {
+    material->alphaMode = "MASK";
+    material->alphaCutoff = threshold;
+  } else if (test && (func == AP::TF_GREATER)) {
+    material->alphaMode = "MASK";
+    material->alphaCutoff = std::min(threshold + 1.0 / 255.0, 1.0); // (strictly greater)
+  } else if (blend || (test && ((func == AP::TF_LESS) || (func == AP::TF_LEQUAL)))) {
+    material->alphaMode = "BLEND";
+  } else {
+    material->alphaMode = "OPAQUE";
+  }
+}
+
 } // namespace ""
 
 // ----------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
-  if (argc < 2) {
-    DOJIMA_LOG( "Usage : " << std::endl << argv[0] << " nif_file" );
+  std::string nifFilename;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--all-lods") {
+      gKeepAllLODs = true;
+    } else {
+      nifFilename = argv[i];
+    }
+  }
+  if (nifFilename.empty()) {
+    DOJIMA_LOG( "Usage : " << std::endl << argv[0] << " [--all-lods] nif_file" << std::endl
+                << "  --all-lods : keep every LOD / skinning variant of the meshes (default : only the best one)." );
     return EXIT_FAILURE;
   }
-  std::string const nifFilename{ argv[1] };
 
   // Create an outputs directory for the transformed NIF file.
   std::string const outputDirectory{
-    [](std::string s) -> std::string {
+    [](std::string const& s) -> std::string {
       return "_outputs" +
-             std::string(&kSystemPathSeparator) +
-             s.replace(s.begin() + s.find_last_of("."), s.end(), "")
-              .substr(s.find_last_of(kSystemPathSeparator) + 1) +
-             std::string(&kSystemPathSeparator);
+             std::string(1, kSystemPathSeparator) +
+             FileStem(s) +
+             std::string(1, kSystemPathSeparator);
     }(nifFilename)
   };
   std::filesystem::create_directories(outputDirectory);
@@ -489,8 +552,9 @@ int main(int argc, char *argv[]) {
   // Retrieve the number of NIF mesh nodes.
   size_t const kNiMeshCount{ getNumBlocks(kNiMeshKey) };
 
-  // Meshes buffers.
-  std::vector<tinygltf::Mesh> Meshes( kNiMeshCount );
+  // Meshes buffers (only the kept ones, see skippedMeshes).
+  std::vector<tinygltf::Mesh> Meshes;
+  Meshes.reserve( kNiMeshCount );
 
   // BufferViews and Accessors are appended as they get created.
   std::vector<tinygltf::BufferView> BufferViews;
@@ -548,15 +612,14 @@ int main(int argc, char *argv[]) {
 
   // Materials buffer.
   // Depends on textures, MaterialData & NiMaterialProperty.
-  std::vector<tinygltf::Material> Materials( kNiMeshCount ); // (might be lower)
+  // (one per mesh, sharing the mesh index)
+  std::vector<tinygltf::Material> Materials;
+  Materials.reserve( kNiMeshCount );
 
   // [ TODO ]
   // Samplers buffer.
   std::vector<tinygltf::Sampler> Samplers( 1 ); //
   // std::map< uint16_t, size_t > mapTexDescFlagToSamplerIndex;
-
-  // Index to available material slot.
-  size_t current_material = 0; //
 
   // -- Texture extraction helpers.
 
@@ -609,12 +672,7 @@ int main(int argc, char *argv[]) {
       mapTextureNameToIndex[texFilename] = *texIndex;
 
       // Extract the texture's basename, removing its path and extension.
-      auto const texName{
-        [](std::string const& fn, size_t pos) -> std::string {
-          size_t startIndex = (pos != std::string::npos) ? pos + 1 : 0;
-          return fn.substr(startIndex, fn.find_last_of('.'));
-        }(texFilename, texFilename.find_last_of('/'))
-      };
+      auto const texName{ FileStem(texFilename) };
 
       img.name = texName;
       img.width = static_cast<uint32_t>(nifPixelData->GetWidth());
@@ -693,19 +751,71 @@ int main(int argc, char *argv[]) {
 
   // -- Meshes
 
-  // Associate a mesh name to its internal id.
-  std::unordered_map<std::string, size_t> mapMeshNameToId;
-  std::unordered_map<std::string, size_t> mapMeshNameToMaterialId;
+  // Associate a NIF mesh to its glTF mesh / material index.
+  // (names are *not* unique within a file, so they cannot be used as keys)
+  std::unordered_map<Niflib::NiObject const*, size_t> mapMeshToId;
+
+  // LODs.
+  //
+  // WotS4 characters embed several copies of each skinned part under a
+  // NiSwitchNode, as children named "LV1_*", "LV3_*"... (LV1 being the best),
+  // which only differ by the number of bones influencing their vertices
+  // (NiSkinningLODController). Exported all together they overlap each others
+  // so, unless asked otherwise, only the best level of each switch is kept.
+  std::unordered_set<Niflib::NiObject const*> skippedNodes;
+  std::unordered_set<Niflib::NiObject const*> skippedMeshes;
+  if (!gKeepAllLODs) {
+    std::function<void(Niflib::NiAVObject const*)> skipSubtree{
+      [&](Niflib::NiAVObject const* n) -> void {
+        skippedNodes.insert(n);
+        if (Niflib::DynamicCast<Niflib::NiMesh>(n)) {
+          skippedMeshes.insert(n);
+        }
+        if (auto nifNode = Niflib::DynamicCast<Niflib::NiNode>(n); nifNode) {
+          for (auto const& child : nifNode->GetChildren()) {
+            skipSubtree(child);
+          }
+        }
+      }
+    };
+    for (auto const& obj : nifList) {
+      auto const switchNode = Niflib::DynamicCast<Niflib::NiSwitchNode>(obj);
+      if (!switchNode) {
+        continue;
+      }
+      int bestLevel = std::numeric_limits<int>::max();
+      for (auto const& child : switchNode->GetChildren()) {
+        if (int const level = ParseLODLevel(child->GetName()); level >= 0) {
+          bestLevel = std::min(bestLevel, level);
+        }
+      }
+      for (auto const& child : switchNode->GetChildren()) {
+        if (int const level = ParseLODLevel(child->GetName()); (level >= 0) && (level != bestLevel)) {
+          skipSubtree(child);
+        }
+      }
+    }
+    if (!skippedMeshes.empty()) {
+      DOJIMA_LOG( "Skipped " << skippedMeshes.size() << " alternate LOD meshes (use --all-lods to keep them)." );
+    }
+  }
 
   auto const& meshIndices = getTypeListIndices( kNiMeshKey );
-  for (size_t mesh_id = 0; mesh_id < meshIndices.size(); ++mesh_id) {
-    auto const nifMesh = Niflib::StaticCast<Niflib::NiMesh>(nifList[meshIndices[mesh_id]]);
+  for (size_t const meshListIndex : meshIndices) {
+    auto const nifMesh = Niflib::StaticCast<Niflib::NiMesh>(nifList[meshListIndex]);
+    if (skippedMeshes.count(nifMesh) > 0) {
+      continue;
+    }
     auto const primType = GetPrimitiveType(nifMesh->GetPrimitiveType());
-    auto &mesh = Meshes.at(mesh_id);
+
+    Meshes.emplace_back();
+    Materials.emplace_back();
+    size_t const mesh_id = Meshes.size() - 1;
+    auto &mesh = Meshes.back();
 
     // Name.
     mesh.name = nifMesh->GetName();
-    mapMeshNameToId[mesh.name] = mesh_id;
+    mapMeshToId[nifMesh] = mesh_id;
 
     // ------------------------
     // Material.
@@ -724,11 +834,14 @@ int main(int argc, char *argv[]) {
     //  ( After each root's "part" node, a NiPixelData is defined containing the
     //   diffuse texture (DXT1) for this part's mesh )
     //
-    size_t const meshMaterialIndex = current_material++; //
-    auto &material = Materials[meshMaterialIndex];
+    size_t const meshMaterialIndex = mesh_id; // (one material per mesh)
+    auto &material = Materials.back();
     material.name = mesh.name + "_mat_" + std::to_string(meshMaterialIndex); //
 
-    mapMeshNameToMaterialId[mesh.name] = meshMaterialIndex; //
+    // The NIF material is a Blinn-Phong one, it has no metal and the glTF
+    // default (fully metallic) would render everything black.
+    material.pbrMetallicRoughness.metallicFactor = 0.0;
+    material.pbrMetallicRoughness.roughnessFactor = 1.0;
 
     //
     // [TODO]
@@ -753,32 +866,22 @@ int main(int argc, char *argv[]) {
 
       // Technically not for metal roughness PBR but well.
       Niflib::Color3 const& diffuse{ matProp->GetDiffuseColor() };
-      material.pbrMetallicRoughness.baseColorFactor = { diffuse.r, diffuse.g, diffuse.b, 1.0 };
+      material.pbrMetallicRoughness.baseColorFactor = { diffuse.r, diffuse.g, diffuse.b, matProp->GetTransparency() };
+
+      // Keep the Blinn-Phong values for users who want to rebuild a specular shading.
+      Niflib::Color3 const& specular{ matProp->GetSpecularColor() };
+      material.extras = tinygltf::Value(tinygltf::Value::Object{
+        { "specularColor", tinygltf::Value(tinygltf::Value::Array{
+            tinygltf::Value(specular.r), tinygltf::Value(specular.g), tinygltf::Value(specular.b) }) },
+        { "glossiness", tinygltf::Value(static_cast<double>(matProp->GetGlossiness())) },
+      });
     }
 
     // Alpha Testing & Blending.
     if (auto prop = nifMesh->GetPropertyByType(Niflib::NiAlphaProperty::TYPE); prop) {
       auto alphaProp = Niflib::StaticCast<Niflib::NiAlphaProperty>(prop);
 
-      auto const alphaTestFunc = alphaProp->GetTestFunc();
-      switch (alphaTestFunc) {
-        case Niflib::NiAlphaProperty::TF_LESS:
-          material.alphaMode = "BLEND";
-        break;
-
-        case Niflib::NiAlphaProperty::TF_GREATER:
-          // (weirdly, some body parts have this flag set for no clear reasons,
-          // should we discard them ?)
-        case Niflib::NiAlphaProperty::TF_GEQUAL:
-          material.alphaMode = "MASK";
-          material.alphaCutoff = alphaProp->GetTestThreshold() / 255.0;
-        break;
-
-        case Niflib::NiAlphaProperty::TF_ALWAYS:
-        default:
-          material.alphaMode = "OPAQUE";
-        break;
-      }
+      SetAlphaMode(*alphaProp, &material);
     }
 
     // Check for double sided geometry.
@@ -1102,7 +1205,7 @@ int main(int argc, char *argv[]) {
   std::unordered_set<Niflib::NiAVObject const*> rigNodes;
   for (auto const& obj : nifList) {
     auto const nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(obj);
-    if (!nifMesh) {
+    if (!nifMesh || (skippedMeshes.count(nifMesh) > 0)) {
       continue;
     }
     for (auto const& modifier : nifMesh->GetModifiers()) {
@@ -1143,6 +1246,11 @@ int main(int argc, char *argv[]) {
   // [lambda] recursive function to fill the node hierarchy.
   std::function<void(tinygltf::Node *const, Niflib::NiAVObject *const, size_t *)> fillNodes{
     [&](tinygltf::Node *const parent, Niflib::NiAVObject *const nifAVO, size_t *mainTexId) -> void {
+      // Alternate LODs are not exported.
+      if (skippedNodes.count(nifAVO) > 0) {
+        return;
+      }
+
       // Rig nodes already created by a previous part are reused.
       bool const isRigNode = (rigNodes.count(nifAVO) > 0);
       int nodeIndex = -1;
@@ -1179,11 +1287,12 @@ int main(int argc, char *argv[]) {
         node.translation = { (double)vTranslation.x, (double)vTranslation.y, (double)vTranslation.z };
 
         if (auto nifMesh = Niflib::DynamicCast<Niflib::NiMesh>(nifAVO); nifMesh) {
-          node.mesh = mapMeshNameToId[node.name];
+          size_t const meshId = mapMeshToId.at(nifMesh);
+          node.mesh = static_cast<int>(meshId);
           meshNodes.emplace_back(nodeIndex, nifMesh);
 
           if (mainTexId) {
-            auto &mat = Materials.at(mapMeshNameToMaterialId[node.name]);
+            auto &mat = Materials.at(meshId);
             mat.pbrMetallicRoughness.baseColorTexture.index = *mainTexId; //
           }
         }
@@ -1273,6 +1382,9 @@ int main(int argc, char *argv[]) {
 
     // Append the node part to the nodes hierarchy.
     for (size_t const i : partOrder) {
+      if (i >= pixelParts.size()) {
+        DOJIMA_LOG( "[Warning] part " << i << " has no matching texture." );
+      }
       // Geometry.
       auto const nodeId = nodeParts[i].data_id;
       auto upperNode = Niflib::StaticCast<Niflib::NiNode>(nifList[nodeId]);
@@ -1290,11 +1402,16 @@ int main(int argc, char *argv[]) {
 
       // ---------------
       // Load side albedo texture on Characters (can fails elsewhere).
-      auto const pixelPart = pixelParts[i];
-      auto texPathNode = Niflib::StaticCast<Niflib::NiStringExtraData>(nifList.at(pixelPart.path_id));
-      auto texPixelNode = Niflib::StaticCast<Niflib::NiPixelData>(nifList.at(pixelPart.data_id));
+      size_t texIndex = 0;
+      bool hasTexture = false;
+      if (i < pixelParts.size()) {
+        auto const pixelPart = pixelParts[i];
+        auto texPathNode = Niflib::StaticCast<Niflib::NiStringExtraData>(nifList.at(pixelPart.path_id));
+        auto texPixelNode = Niflib::StaticCast<Niflib::NiPixelData>(nifList.at(pixelPart.data_id));
+        hasTexture = processInternalTexture(texPixelNode, texPathNode->GetData(), &texIndex);
+      }
 
-      if (size_t texIndex; processInternalTexture(texPixelNode, texPathNode->GetData(), &texIndex)) {
+      if (hasTexture) {
         fillNodes(root_node_ptr, upperNode, &texIndex);
 
         // [ TODO ]
