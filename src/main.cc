@@ -38,6 +38,8 @@
 #include "nif/obj/NiNode.h"
 #include "nif/obj/NiMesh.h"
 #include "nif/obj/NiSwitchNode.h"
+#include "nif/obj/NiPointLight.h"
+#include "nif/obj/NiDirectionalLight.h"
 #include "nif/obj/NiMeshModifier.h"
 #include "nif/obj/NiSkinningMeshModifier.h"
 #include "nif/obj/NiDataStream.h"
@@ -618,7 +620,27 @@ int main(int argc, char *argv[]) {
 
   // [ TODO ]
   // Samplers buffer.
-  std::vector<tinygltf::Sampler> Samplers( 1 ); //
+  std::vector<tinygltf::Sampler> Samplers( 1 ); // (0 : default, repeat)
+
+  // Returns the sampler matching a NIF clamp mode, created on demand.
+  std::unordered_map<int, int> mapClampToSampler;
+  auto getSampler{
+    [&](Niflib::TexClampMode mode) -> int {
+      if (mode == Niflib::WRAP_S_WRAP_T) {
+        return 0;
+      }
+      if (auto it = mapClampToSampler.find(mode); it != mapClampToSampler.end()) {
+        return it->second;
+      }
+      bool const clampS = (mode == Niflib::CLAMP_S_CLAMP_T) || (mode == Niflib::CLAMP_S_WRAP_T);
+      bool const clampT = (mode == Niflib::CLAMP_S_CLAMP_T) || (mode == Niflib::WRAP_S_CLAMP_T);
+      tinygltf::Sampler sampler;
+      sampler.wrapS = clampS ? TINYGLTF_TEXTURE_WRAP_CLAMP_TO_EDGE : TINYGLTF_TEXTURE_WRAP_REPEAT;
+      sampler.wrapT = clampT ? TINYGLTF_TEXTURE_WRAP_CLAMP_TO_EDGE : TINYGLTF_TEXTURE_WRAP_REPEAT;
+      Samplers.push_back(sampler);
+      return mapClampToSampler[mode] = static_cast<int>(Samplers.size()) - 1;
+    }
+  };
   // std::map< uint16_t, size_t > mapTexDescFlagToSamplerIndex;
 
   // -- Texture extraction helpers.
@@ -734,7 +756,7 @@ int main(int argc, char *argv[]) {
   // [lambda] Wrapper for processInternalTexture using Niflib::TexDesc.
   // When the texture is available the texIndex is set and the function return true.
   auto processTexDesc{
-    [processInternalTexture](Niflib::TexDesc const& texDesc, size_t* texIndex) -> bool {
+    [&](Niflib::TexDesc const& texDesc, size_t* texIndex) -> bool {
       auto srcTex = texDesc.source;
       if (nullptr == srcTex) {
         return false;
@@ -743,9 +765,13 @@ int main(int argc, char *argv[]) {
         DOJIMA_QUIET_LOG( "[ Warning ] External texture loading is not supported." );
         return false;
       }
-      // [ TODO ]
-      // Retrieve sampler from texdesc flag and samplerMap.
-      return processInternalTexture(srcTex->GetPixelData(), srcTex->GetTextureFileName(), texIndex);
+      bool const isNew = (mapTextureNameToIndex.count(srcTex->GetTextureFileName()) == 0);
+      bool const ok = processInternalTexture(srcTex->GetPixelData(), srcTex->GetTextureFileName(), texIndex);
+      if (ok && isNew) {
+        // (textures are shared by name, so the first use decides of the wrapping)
+        Textures[*texIndex].sampler = getSampler(texDesc.clampMode);
+      }
+      return ok;
     }
   };
 
@@ -1177,6 +1203,8 @@ int main(int argc, char *argv[]) {
   for (auto const& n : nifList) {
     auto ptr = Niflib::DynamicCast<Niflib::NiAVObject>(n);
     totalNodeCount += (ptr != nullptr) ? 1 : 0;
+    // (lights are held by an additional child node)
+    totalNodeCount += (Niflib::DynamicCast<Niflib::NiPointLight>(n) || Niflib::DynamicCast<Niflib::NiDirectionalLight>(n)) ? 1 : 0;
   }
 
   Nodes.reserve(totalNodeCount);
@@ -1184,6 +1212,7 @@ int main(int argc, char *argv[]) {
   // NIF object to glTF node index, and the nodes holding a mesh (skins are
   // created once the whole hierarchy is known, as bones might be visited after
   // the meshes they influence).
+  std::vector<tinygltf::Light> Lights;
   std::unordered_map<Niflib::NiAVObject const*, int> mapNifToNode;
   std::vector<std::pair<int, Niflib::Ref<Niflib::NiMesh>>> meshNodes;
 
@@ -1294,6 +1323,33 @@ int main(int argc, char *argv[]) {
           if (mainTexId) {
             auto &mat = Materials.at(meshId);
             mat.pbrMetallicRoughness.baseColorTexture.index = *mainTexId; //
+          }
+        }
+
+        // Lights (glTF has no ambient light, which is dropped).
+        // NIF directional lights shine along their local +X, glTF's along -Z :
+        // the light is held by a child node applying the fixed rotation.
+        if (auto nifLight = Niflib::DynamicCast<Niflib::NiLight>(nifAVO); nifLight) {
+          bool const isDirectional = (nullptr != Niflib::DynamicCast<Niflib::NiDirectionalLight>(nifAVO));
+          bool const isPoint = (nullptr != Niflib::DynamicCast<Niflib::NiPointLight>(nifAVO));
+          if (isDirectional || isPoint) {
+            Niflib::Color3 const c = nifLight->GetDiffuseColor();
+            tinygltf::Light light;
+            light.name = node.name;
+            light.type = isDirectional ? "directional" : "point";
+            light.color = { c.r, c.g, c.b };
+            light.intensity = nifLight->GetDimmer();
+            Lights.push_back(light);
+
+            tinygltf::Node lightNode;
+            lightNode.name = node.name + "_light";
+            if (isDirectional) {
+              lightNode.rotation = { 0.0, -0.70710678118654752, 0.0, 0.70710678118654752 };
+            }
+            lightNode.extensions["KHR_lights_punctual"] = tinygltf::Value(tinygltf::Value::Object{
+              { "light", tinygltf::Value(static_cast<int>(Lights.size()) - 1) } });
+            Nodes.push_back(lightNode);
+            Nodes[nodeIndex].children.push_back(static_cast<int>(Nodes.size()) - 1);
           }
         }
 
@@ -1586,7 +1642,7 @@ int main(int argc, char *argv[]) {
     data.skins = std::move( Skins );
     //data.animations;
     //data.cameras;
-    //data.lights;
+    data.lights = std::move( Lights );
 
     tinygltf::Scene scene;
     scene.nodes.push_back(0);
