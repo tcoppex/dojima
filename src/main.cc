@@ -65,6 +65,9 @@ using half_float::half;
 // Save DDS.
 #include "dds.h"
 
+// Read keyframe files (animations).
+#include "kf.h"
+
 // STB image.
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
@@ -115,6 +118,16 @@ static constexpr bool kGLTFWriteBinary = false;
 // Keep every LOD of the characters parts (see --all-lods), instead of only the
 // highest quality one.
 static bool gKeepAllLODs = false;
+
+// Keyframe files (*.kf) whose sequences are exported as glTF animations.
+static std::vector<std::string> gAnimFilenames;
+
+// Sampling rate (frames per second) of the exported animations.
+static float gAnimFps = 30.0f;
+
+// Keep the movement accumulated by the root of the animations (see --root-motion),
+// instead of animating them in place.
+static bool gKeepRootMotion = false;
 
 // OS specific path separator.
 static constexpr char kSystemPathSeparator{
@@ -329,6 +342,41 @@ std::string FileStem(std::string const& path) {
   return name;
 }
 
+// Returns true if the path has a ".kf" extension.
+bool IsKeyframeFile(std::string const& path) {
+  if (path.size() < 3u) {
+    return false;
+  }
+  std::string ext = path.substr(path.size() - 3u);
+  std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+  return ext == ".kf";
+}
+
+std::vector<float> MakeSampleTimes(float duration, float fps) {
+  std::vector<float> times{ 0.0f };
+  if (duration <= 1e-6f) {
+    return times;
+  }
+  for (size_t i = 1; ; ++i) {
+    float const t = static_cast<float>(i) / fps;
+    if (t >= duration - 1e-4f) {
+      break;
+    }
+    times.push_back(t);
+  }
+  times.push_back(duration);
+  return times;
+}
+
+char const* CycleTypeName(kf::CycleType cycle) {
+  switch (cycle) {
+    case kf::CycleType::kLoop:    return "loop";
+    case kf::CycleType::kReverse: return "reverse";
+    case kf::CycleType::kClamp:   return "clamp";
+  }
+  return "unknown";
+}
+
 // Convert a NiAlphaProperty to a glTF alpha mode.
 //
 // WotS4 draws characters' hair and lashes in two passes : an alpha tested one
@@ -380,16 +428,43 @@ void SetAlphaMode(Niflib::NiAlphaProperty const& prop, tinygltf::Material *mater
 
 int main(int argc, char *argv[]) {
   std::string nifFilename;
+  bool badArguments = false;
   for (int i = 1; i < argc; ++i) {
-    if (std::string(argv[i]) == "--all-lods") {
+    std::string const arg(argv[i]);
+    if (arg == "--all-lods") {
       gKeepAllLODs = true;
+    } else if (arg == "--root-motion") {
+      gKeepRootMotion = true;
+    } else if ((arg == "--anim-fps") && (i + 1 < argc)) {
+      gAnimFps = static_cast<float>(std::atof(argv[++i]));
+    } else if (arg == "--anim") {
+      if (i + 1 < argc) {
+        gAnimFilenames.push_back(argv[++i]);
+      } else {
+        badArguments = true;
+      }
+    } else if (IsKeyframeFile(arg)) {
+      gAnimFilenames.push_back(arg);
+    } else if (arg.compare(0, 2, "--") == 0) {
+      DOJIMA_LOG( "[Error] unknown option : " << arg );
+      badArguments = true;
     } else {
-      nifFilename = argv[i];
+      nifFilename = arg;
     }
   }
-  if (nifFilename.empty()) {
-    DOJIMA_LOG( "Usage : " << std::endl << argv[0] << " [--all-lods] nif_file" << std::endl
-                << "  --all-lods : keep every LOD / skinning variant of the meshes (default : only the best one)." );
+  if (!(gAnimFps >= 1.0f) || !(gAnimFps <= 240.0f)) {
+    DOJIMA_LOG( "[Error] --anim-fps must be between 1 and 240." );
+    badArguments = true;
+  }
+  if (nifFilename.empty() || badArguments) {
+    DOJIMA_LOG( "Usage : " << std::endl
+                << argv[0] << " [options] nif_file [kf_file...]" << std::endl
+                << "  --all-lods      : keep every LOD / skinning variant of the meshes (default : only the best one)." << std::endl
+                << "  --anim kf_file  : export the animations of a keyframe file along the model" << std::endl
+                << "                    (a '.kf' file given as argument is also exported)." << std::endl
+                << "  --anim-fps n    : sampling rate of the exported animations (default : 30)." << std::endl
+                << "  --root-motion   : keep the movement accumulated by the animations' root node" << std::endl
+                << "                    (default : the animations are played in place)." );
     return EXIT_FAILURE;
   }
 
@@ -1641,28 +1716,269 @@ int main(int argc, char *argv[]) {
     bakeRestPose(0, Identity());
   }
 
+  // -- Animations.
+  //
+  // Each sequence of the keyframe files is exported as a glTF animation. Its
+  // evaluators (one per animated node, as B-splines or keyframes) are resampled
+  // at a fixed rate to translation / rotation / scale channels. The nodes are
+  // targeted by name, on the shared rig when it has the node, as parts hold
+  // their own copies of the skeleton.
+  std::vector<tinygltf::Animation> Animations;
+  if (!gAnimFilenames.empty() && !Nodes.empty()) {
+    std::unordered_map<std::string, std::vector<int>> mapNameToNodes;
+    for (size_t i = 0; i < Nodes.size(); ++i) {
+      mapNameToNodes[Nodes[i].name].push_back(static_cast<int>(i));
+    }
+    auto findTargets = [&](std::string const& name) -> std::vector<int> {
+      if (auto it = mapRigNameToNode.find(name); it != mapRigNameToNode.end()) {
+        return { it->second };
+      }
+      if (auto it = mapNameToNodes.find(name); it != mapNameToNodes.end()) {
+        return it->second;
+      }
+      return {};
+    };
+
+    // [lambda] Create an animation accessor (not bound to a buffer view target).
+    auto addAnimAccessor{
+      [&](std::string const& name, std::vector<float> const& values, int type, size_t numComps, bool bounds) -> int {
+        size_t const count = values.size() / numComps;
+
+        tinygltf::Accessor acc;
+        acc.name = kNameAccessors ? name : "";
+        acc.bufferView = addBufferView(BufferId::VERTEX, values.data(), values.size() * sizeof(float), 0);
+        acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+        acc.type = type;
+        acc.count = count;
+        if (bounds && (count > 0u)) {
+          acc.minValues.assign(numComps,  std::numeric_limits<double>::max());
+          acc.maxValues.assign(numComps, -std::numeric_limits<double>::max());
+          for (size_t i = 0; i < count; ++i) {
+            for (size_t c = 0; c < numComps; ++c) {
+              double const v = values[i * numComps + c];
+              acc.minValues[c] = std::min(acc.minValues[c], v);
+              acc.maxValues[c] = std::max(acc.maxValues[c], v);
+            }
+          }
+        }
+        Accessors.push_back(acc);
+        return static_cast<int>(Accessors.size()) - 1;
+      }
+    };
+
+    for (auto const& kfFilename : gAnimFilenames) {
+      kf::File kfFile;
+      if (std::string error; !kf::Load(kfFilename, &kfFile, &error)) {
+        DOJIMA_LOG( "[Error] " << kfFilename << " : " << error );
+        continue;
+      }
+
+      size_t numChannels = 0;
+      size_t numPlayed = 0;
+      std::unordered_set<std::string> missingTargets;
+      std::unordered_set<std::string> unsupportedEvaluators;
+
+      for (auto const& seq : kfFile.sequences) {
+        tinygltf::Animation anim;
+        anim.name = seq.name.empty() ? FileStem(kfFilename) : seq.name;
+
+        std::vector<float> const times = MakeSampleTimes(seq.duration, gAnimFps);
+        int timeAccessor = -1; // (created along the first channel)
+
+        // Each (node, path) can be targeted only once by an animation.
+        std::unordered_set<std::string> targeted;
+
+        // [lambda] Add a sampler (once) and the channels targeting the nodes with it.
+        auto addChannels = [&](std::vector<int> const& nodes, char const* path, std::vector<float> const& values,
+                               int type, size_t numComps, auto const& isRestValue) -> void {
+          int sampler = -1;
+          for (int const nodeIndex : nodes) {
+            if (isRestValue(Nodes[nodeIndex])) {
+              continue;
+            }
+            if (!targeted.insert(std::to_string(nodeIndex) + path).second) {
+              DOJIMA_QUIET_LOG( "[Warning] " << anim.name << " : '" << Nodes[nodeIndex].name << "' has several " << path << " channels." );
+              continue;
+            }
+            if (sampler < 0) {
+              if (timeAccessor < 0) {
+                timeAccessor = addAnimAccessor("TIME", times, TINYGLTF_TYPE_SCALAR, 1, true);
+              }
+              tinygltf::AnimationSampler s;
+              s.input = timeAccessor;
+              s.output = addAnimAccessor(path, values, type, numComps, false);
+              s.interpolation = "LINEAR";
+              anim.samplers.push_back(s);
+              sampler = static_cast<int>(anim.samplers.size()) - 1;
+            }
+            tinygltf::AnimationChannel channel;
+            channel.sampler = sampler;
+            channel.target_node = nodeIndex;
+            channel.target_path = path;
+            anim.channels.push_back(channel);
+          }
+        };
+
+        // [lambda] Sample a channel at every time, false if it is not animated.
+        auto sampleChannel = [&](kf::Channel const& c, std::vector<float> *values) -> bool {
+          size_t const nc = static_cast<size_t>(c.numComps);
+          values->assign(times.size() * nc, 0.0f);
+          for (size_t i = 0; i < times.size(); ++i) {
+            if (!kf::Sample(c, times[i], &(*values)[i * nc])) {
+              return false;
+            }
+          }
+          return true;
+        };
+
+        constexpr float kEpsilon = 1e-5f;
+
+        for (auto const& evaluator : seq.evaluators) {
+          auto const targets = findTargets(evaluator.target);
+          if (targets.empty()) {
+            missingTargets.insert(evaluator.target);
+            continue;
+          }
+          bool const isAccumRoot = (evaluator.target == seq.accumRoot);
+          std::vector<float> values;
+
+          // Translation.
+          if (sampleChannel(evaluator.translation, &values)) {
+            if (isAccumRoot && !gKeepRootMotion) {
+              for (size_t axis = 0; axis < 3u; ++axis) {
+                if (seq.accumFlags & (static_cast<uint32_t>(kf::kAccumXTrans) << axis)) {
+                  for (size_t i = 1; i < times.size(); ++i) {
+                    values[i * 3u + axis] = values[axis];
+                  }
+                }
+              }
+            }
+            addChannels(targets, "translation", values, TINYGLTF_TYPE_VEC3, 3u, [&](tinygltf::Node const& node) {
+              for (size_t i = 0; i < values.size(); ++i) {
+                double const rest = (node.translation.size() == 3u) ? node.translation[i % 3u] : 0.0;
+                if (std::abs(static_cast<double>(values[i]) - rest) > static_cast<double>(kEpsilon)) {
+                  return false;
+                }
+              }
+              return true;
+            });
+          }
+
+          // Rotation (kf quaternions are w, x, y, z, glTF's x, y, z, w).
+          if (sampleChannel(evaluator.rotation, &values)) {
+            // Keep the quaternions in the same hemisphere, so the interpolation
+            // always takes the shortest path.
+            for (size_t i = 1; i < times.size(); ++i) {
+              float const* p = &values[(i - 1u) * 4u];
+              float *q = &values[i * 4u];
+              if (p[0]*q[0] + p[1]*q[1] + p[2]*q[2] + p[3]*q[3] < 0.0f) {
+                for (int c = 0; c < 4; ++c) q[c] = -q[c];
+              }
+            }
+            for (size_t i = 0; i < times.size(); ++i) {
+              float *q = &values[i * 4u];
+              std::rotate(q, q + 1, q + 4);
+            }
+            addChannels(targets, "rotation", values, TINYGLTF_TYPE_VEC4, 4u, [&](tinygltf::Node const& node) {
+              if (node.rotation.size() != 4u) {
+                return false;
+              }
+              for (size_t i = 0; i < times.size(); ++i) {
+                double dot = 0.0;
+                for (size_t c = 0; c < 4u; ++c) {
+                  dot += static_cast<double>(values[i * 4u + c]) * node.rotation[c];
+                }
+                if (1.0 - std::abs(dot) > 1e-6) {
+                  return false;
+                }
+              }
+              return true;
+            });
+          }
+
+          // Scale (uniform).
+          if (sampleChannel(evaluator.scale, &values)) {
+            std::vector<float> scales(values.size() * 3u);
+            for (size_t i = 0; i < values.size(); ++i) {
+              scales[i * 3u + 0u] = scales[i * 3u + 1u] = scales[i * 3u + 2u] = values[i];
+            }
+            addChannels(targets, "scale", scales, TINYGLTF_TYPE_VEC3, 3u, [&](tinygltf::Node const& node) {
+              for (size_t i = 0; i < scales.size(); ++i) {
+                double const rest = (node.scale.size() == 3u) ? node.scale[i % 3u] : 1.0;
+                if (std::abs(static_cast<double>(scales[i]) - rest) > static_cast<double>(kEpsilon)) {
+                  return false;
+                }
+              }
+              return true;
+            });
+          }
+        }
+        unsupportedEvaluators.insert(seq.unsupported.begin(), seq.unsupported.end());
+
+        if (anim.channels.empty()) {
+          DOJIMA_LOG( "[Warning] " << kfFilename << " : sequence '" << anim.name << "' has no channel matching the model." );
+          continue;
+        }
+
+        // Keep the playback informations of the game, as glTF has no equivalent.
+        // [TODO: extract as custom file / json ?]
+        tinygltf::Value::Array textKeys;
+        for (auto const& key : seq.textKeys) {
+          textKeys.push_back(tinygltf::Value(tinygltf::Value::Object{
+            { "time", tinygltf::Value(static_cast<double>(key.time)) },
+            { "text", tinygltf::Value(key.text) },
+          }));
+        }
+        anim.extras = tinygltf::Value(tinygltf::Value::Object{
+          { "cycle",       tinygltf::Value(std::string(CycleTypeName(seq.cycle))) },
+          { "duration",    tinygltf::Value(static_cast<double>(seq.duration)) },
+          { "frequency",   tinygltf::Value(static_cast<double>(seq.frequency)) },
+          { "accumRoot",   tinygltf::Value(seq.accumRoot) },
+          { "accumFlags",  tinygltf::Value(static_cast<int>(seq.accumFlags)) },
+          { "rootMotion",  tinygltf::Value(gKeepRootMotion) },
+          { "textKeys",    tinygltf::Value(textKeys) },
+        });
+
+        numChannels += anim.channels.size();
+        ++numPlayed;
+        Animations.push_back(std::move(anim));
+      }
+
+      DOJIMA_LOG( kfFilename << " : " << numPlayed << " animation(s) exported (" << numChannels << " channels, "
+                  << gAnimFps << " fps" << (gKeepRootMotion ? ", with root motion" : ", in place") << ")." );
+      if (!missingTargets.empty()) {
+        std::string names;
+        size_t shown = 0;
+        for (auto const& name : missingTargets) {
+          names += (shown++ < 8u) ? (name + " ") : "";
+        }
+        DOJIMA_LOG( "[Warning] " << missingTargets.size() << " animated node(s) not found in the model : " << names
+                    << ((missingTargets.size() > 8u) ? "..." : "") );
+      }
+      for (auto const& type : unsupportedEvaluators) {
+        DOJIMA_LOG( "[Warning] " << type << " evaluators are not supported (skipped)." );
+      }
+    }
+  }
+
   tinygltf::Model data{};
   {
     data.asset.generator = "nif2gltf";
     data.asset.version = "2.0";
 
-    data.meshes = std::move( Meshes );
-    data.materials = std::move( Materials );
-    data.accessors = std::move( Accessors );
-    data.bufferViews = std::move( BufferViews );
-    data.buffers = std::move( Buffers );
-    data.nodes = std::move( Nodes );
-
-    if constexpr(true) {
-      data.images = std::move( Images );
-      data.textures = std::move( Textures );
-      data.samplers = std::move( Samplers );
-    }
-
-    data.skins = std::move( Skins );
-    //data.animations;
-    //data.cameras;
-    data.lights = std::move( Lights );
+    data.accessors    = std::move( Accessors );
+    data.animations   = std::move( Animations );
+    data.buffers      = std::move( Buffers );
+    data.bufferViews  = std::move( BufferViews );
+    data.materials    = std::move( Materials );
+    data.meshes       = std::move( Meshes );
+    data.nodes        = std::move( Nodes );
+    data.textures     = std::move( Textures );
+    data.images       = std::move( Images );
+    data.skins        = std::move( Skins );
+    data.samplers     = std::move( Samplers );
+    data.lights       = std::move( Lights );
+    // data.cameras;
 
     tinygltf::Scene scene;
     scene.nodes.push_back(0);
