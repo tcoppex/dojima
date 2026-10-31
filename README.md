@@ -10,12 +10,18 @@
 
 #### Features
 
-- [x] mesh hierarchy (*Maps, Characters*),
-- [x] float16 buffers (*Maps, Items, Accessories & Weapons*),
-- [x] materials,
-- [ ] bones,
-- [ ] skeletal animation,
-- [ ] facial animation
+##### WotS4
+
+- [x] mesh hierarchy (*Maps, Characters*)
+- [x] float16 buffers (*Maps, Items, Accessories & Weapons*)
+- [x] materials
+- [x] skinning
+- [x] keyframe animations
+
+##### WotS3
+
+- [x] triangle strip meshes (*Maps, Items*)
+- [x] materials
 
 ### Quick start
 
