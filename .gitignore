@@ -3,6 +3,7 @@ build
 bin
 _outputs
 DATA
+DOCS
 *.dev.md
 
 # Prerequisites
