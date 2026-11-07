@@ -6,20 +6,24 @@
 
 #include <cassert>
 #include <cctype>
-#include <cstdlib>
 #include <cstddef>
-
-#include <array>
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
-#include <type_traits>
+#include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -97,37 +101,35 @@ using half_float::half;
 
 namespace {
 
-// Display NIF header information at loading.
-static constexpr bool kDisplayHeader = true;
-
-static constexpr bool kShowDebugRefArborescence = false;
-
-// Output external PNG for debugging.
-static constexpr bool kDebugOutputPNG = false; //
-static constexpr bool kDebugOutputDDS = false; //
-
-// Output name for accessors.
-static constexpr bool kNameAccessors = true;
-
-// glTF output options.
 static constexpr bool kGLTFEmbedImages = true;
 static constexpr bool kGLTFEmbedBuffers = true;
+static constexpr bool kNameAccessors = true;
 static constexpr bool kGLTFPrettyPrint = true;
 static constexpr bool kGLTFWriteBinary = false;
 
-// Keep every LOD of the characters parts (see --all-lods), instead of only the
-// highest quality one.
-static bool gKeepAllLODs = false;
+// -----------------------------------
+// Command line parameters.
 
-// Keyframe files (*.kf) whose sequences are exported as glTF animations.
+static bool gKeepAllLODs = false; // --all-lods
+
 static std::vector<std::string> gAnimFilenames;
+static std::string gAnimFilter;                   // --anim-filter
+static std::string gDatabaseDirectory;            // --db
+static std::string gAnimCategory;
+static std::string gMotionNamesFile;
 
-// Sampling rate (frames per second) of the exported animations.
-static float gAnimFps = 30.0f;
+static float gAnimFps = 30.0f;                    // --fps
+static float gAnimMinMatch = 0.0f;                // --anim-min-match
 
-// Keep the movement accumulated by the root of the animations (see --root-motion),
-// instead of animating them in place.
-static bool gKeepRootMotion = false;
+static bool gEmbedAnims = false;                  // --embed-anims
+static bool gSplitAnims = false;                  // --split-anims
+static bool gLibraryAnims = false;                // --library
+static bool gKeepRootMotion = false;              // --root-motion
+static bool gAnimCubic = false;                   // --anim-cubic
+static bool gDropRestChannels = true;
+static bool gWriteManifest = true;
+
+// -----------------------------------
 
 // OS specific path separator.
 static constexpr char kSystemPathSeparator{
@@ -377,6 +379,495 @@ char const* CycleTypeName(kf::CycleType cycle) {
   return "unknown";
 }
 
+std::string FileName(std::string const& path) {
+  size_t const start = path.find_last_of("/\\");
+  return path.substr((start == std::string::npos) ? 0 : start + 1);
+}
+
+// Adds every keyframe file found under a directory (recursively, sorted).
+size_t CollectKeyframeFiles(std::string const& directory, std::vector<std::string> *out) {
+  namespace fs = std::filesystem;
+  std::vector<std::string> found;
+  std::error_code ec;
+  fs::recursive_directory_iterator it(directory, ec);
+  fs::recursive_directory_iterator const end;
+  for (; !ec && (it != end); it.increment(ec)) {
+    std::error_code ec2;
+    if (it->is_regular_file(ec2) && IsKeyframeFile(it->path().string())) {
+      found.push_back(it->path().string());
+    }
+  }
+  std::sort(found.begin(), found.end());
+  out->insert(out->end(), found.begin(), found.end());
+  return found.size();
+}
+
+std::string SanitizeName(std::string const& name) {
+  std::string s;
+  for (char const c : name) {
+    bool const ok = std::isalnum(static_cast<unsigned char>(c)) || (c == '_') || (c == '-') || (c == '.');
+    s.push_back(ok ? c : '_');
+  }
+  if (s.size() > 96u) {
+    s.resize(96u);
+  }
+  while (!s.empty() && (s.front() == '.')) {
+    s.erase(s.begin());
+  }
+  return s.empty() ? std::string("unnamed") : s;
+}
+
+std::string UniqueName(std::string const& name, std::unordered_set<std::string> *used) {
+  if (used->insert(name).second) {
+    return name;
+  }
+  for (size_t n = 2; ; ++n) {
+    std::string const candidate = name + "_" + std::to_string(n);
+    if (used->insert(candidate).second) {
+      return candidate;
+    }
+  }
+}
+
+// FNV-1a (64 bits), used to identify files and rigs.
+uint64_t Fnv1a(void const* data, size_t size, uint64_t hash = 14695981039346656037ull) {
+  auto const* p = static_cast<uint8_t const*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash = (hash ^ p[i]) * 1099511628211ull;
+  }
+  return hash;
+}
+
+std::string HexString(uint64_t value, size_t digits) {
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(value));
+  std::string s(buffer);
+  return s.substr(s.size() - std::min(digits, s.size()));
+}
+
+std::string HashFile(std::string const& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return std::string();
+  }
+  uint64_t hash = 14695981039346656037ull;
+  std::vector<char> chunk(1u << 16);
+  while (in) {
+    in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    hash = Fnv1a(chunk.data(), static_cast<size_t>(in.gcount()), hash);
+  }
+  return HexString(hash, 16u);
+}
+
+// ----------------------------------------------------------------------------
+//  Animation clips.
+//
+//  A clip is a sampled sequence, independent from any glTF buffer : it can be
+//  embedded in the character's model, or written alone next to the skeleton.
+// ----------------------------------------------------------------------------
+
+struct ClipSampler {
+  int type = TINYGLTF_TYPE_VEC3;
+  size_t numComps = 3u;
+  std::vector<float> values;
+};
+
+struct ClipChannel {
+  int node = -1;          // (index in the full model's nodes)
+  std::string path;       // translation, rotation or scale
+  int sampler = -1;
+};
+
+struct Clip {
+  std::string name;       // unique name (animation name)
+  std::string sequence;   // name of the sequence in the kf file
+  std::string sourceFile; // kf file name
+  std::string sourceHash; // hash of the kf file
+  std::string fileStem;   // unique file name of the standalone clip
+  std::string file;       // relative path of the standalone clip (when written)
+
+  float duration = 0.0f;
+  float frequency = 1.0f;
+  std::string cycle;
+  std::string accumRoot;
+  uint32_t accumFlags = 0u;
+  bool rootMotion = false;
+  std::vector<std::pair<float, std::string>> textKeys;
+
+  std::vector<float> times;
+  std::vector<ClipSampler> samplers;
+  std::vector<ClipChannel> channels;
+
+  // Compatibility with the model : animated nodes (evaluators) found / total.
+  size_t numTargets = 0u;
+  size_t numFound = 0u;
+  std::vector<std::string> missing;
+};
+
+tinygltf::Value ClipExtras(Clip const& clip) {
+  tinygltf::Value::Array textKeys;
+  for (auto const& key : clip.textKeys) {
+    textKeys.push_back(tinygltf::Value(tinygltf::Value::Object{
+      { "time", tinygltf::Value(static_cast<double>(key.first)) },
+      { "text", tinygltf::Value(key.second) },
+    }));
+  }
+  return tinygltf::Value(tinygltf::Value::Object{
+    { "cycle",       tinygltf::Value(clip.cycle) },
+    { "duration",    tinygltf::Value(static_cast<double>(clip.duration)) },
+    { "frequency",   tinygltf::Value(static_cast<double>(clip.frequency)) },
+    { "accumRoot",   tinygltf::Value(clip.accumRoot) },
+    { "accumFlags",  tinygltf::Value(static_cast<int>(clip.accumFlags)) },
+    { "rootMotion",  tinygltf::Value(clip.rootMotion) },
+    { "sourceFile",  tinygltf::Value(clip.sourceFile) },
+    { "sourceHash",  tinygltf::Value(clip.sourceHash) },
+    { "textKeys",    tinygltf::Value(textKeys) },
+  });
+}
+
+// Appends clips as glTF animations of a model.
+void AppendClips(tinygltf::Model *model, std::vector<Clip const*> const& clips, std::vector<int> const& remap) {
+  tinygltf::Buffer buffer;
+  int const bufferIndex = static_cast<int>(model->buffers.size());
+
+  // [lambda] Store floats in the buffer and create their accessor.
+  auto addAccessor = [&](std::string const& name, std::vector<float> const& values, int type,
+                         size_t numComps, bool bounds) -> int {
+    size_t const offset = buffer.data.size();
+    size_t const bytes = values.size() * sizeof(float);
+    buffer.data.resize(offset + bytes);
+    if (bytes > 0u) {
+      std::memcpy(buffer.data.data() + offset, values.data(), bytes);
+    }
+
+    tinygltf::BufferView view;
+    view.buffer = bufferIndex;
+    view.byteOffset = offset;
+    view.byteLength = bytes;
+    model->bufferViews.push_back(view);
+
+    size_t const count = values.size() / numComps;
+    tinygltf::Accessor acc;
+    acc.name = kNameAccessors ? name : "";
+    acc.bufferView = static_cast<int>(model->bufferViews.size()) - 1;
+    acc.byteOffset = 0;
+    acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+    acc.type = type;
+    acc.count = count;
+    if (bounds && (count > 0u)) {
+      acc.minValues.assign(numComps,  std::numeric_limits<double>::max());
+      acc.maxValues.assign(numComps, -std::numeric_limits<double>::max());
+      for (size_t i = 0; i < count; ++i) {
+        for (size_t c = 0; c < numComps; ++c) {
+          double const v = values[i * numComps + c];
+          acc.minValues[c] = std::min(acc.minValues[c], v);
+          acc.maxValues[c] = std::max(acc.maxValues[c], v);
+        }
+      }
+    }
+    model->accessors.push_back(acc);
+    return static_cast<int>(model->accessors.size()) - 1;
+  };
+
+  for (Clip const* clip : clips) {
+    tinygltf::Animation anim;
+    anim.name = clip->name;
+
+    int timeAccessor = -1; // (created along the first channel)
+    std::vector<int> samplerMap(clip->samplers.size(), -1);
+    for (ClipChannel const& ch : clip->channels) {
+      int node = ch.node;
+      if (!remap.empty()) {
+        node = ((node >= 0) && (static_cast<size_t>(node) < remap.size())) ? remap[static_cast<size_t>(node)] : -1;
+      }
+      if ((node < 0) || (ch.sampler < 0) || (static_cast<size_t>(ch.sampler) >= samplerMap.size())) {
+        continue;
+      }
+
+      int &sampler = samplerMap[static_cast<size_t>(ch.sampler)];
+      if (sampler < 0) {
+        ClipSampler const& cs = clip->samplers[static_cast<size_t>(ch.sampler)];
+        if (timeAccessor < 0) {
+          timeAccessor = addAccessor("TIME", clip->times, TINYGLTF_TYPE_SCALAR, 1u, true);
+        }
+        tinygltf::AnimationSampler s;
+        s.input = timeAccessor;
+        s.output = addAccessor(ch.path, cs.values, cs.type, cs.numComps, false);
+        s.interpolation = "LINEAR";
+        anim.samplers.push_back(s);
+        sampler = static_cast<int>(anim.samplers.size()) - 1;
+      }
+
+      tinygltf::AnimationChannel channel;
+      channel.sampler = sampler;
+      channel.target_node = node;
+      channel.target_path = ch.path;
+      anim.channels.push_back(channel);
+    }
+    if (anim.channels.empty()) {
+      continue;
+    }
+    anim.extras = ClipExtras(*clip);
+    model->animations.push_back(std::move(anim));
+  }
+
+  if (!buffer.data.empty()) {
+    model->buffers.push_back(std::move(buffer));
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  Rigs (skeletons without any mesh).
+// ----------------------------------------------------------------------------
+
+std::vector<int> ParentIndices(std::vector<tinygltf::Node> const& nodes) {
+  std::vector<int> parents(nodes.size(), -1);
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    for (int const child : nodes[i].children) {
+      if ((child >= 0) && (static_cast<size_t>(child) < nodes.size())) {
+        parents[static_cast<size_t>(child)] = static_cast<int>(i);
+      }
+    }
+  }
+  return parents;
+}
+
+// Hash a rig of its sorted entries (name, parent, rest pose).
+std::string ComputeRigId(std::vector<tinygltf::Node> const& nodes, std::vector<int> const& rigIndices) {
+  std::vector<int> const parents = ParentIndices(nodes);
+  std::vector<std::string> lines;
+  for (int const index : rigIndices) {
+    tinygltf::Node const& n = nodes[static_cast<size_t>(index)];
+    int const p = parents[static_cast<size_t>(index)];
+    std::ostringstream line;
+    line << n.name << '|' << ((p >= 0) ? nodes[static_cast<size_t>(p)].name : std::string());
+    char buffer[32];
+    for (double const v : n.translation) { std::snprintf(buffer, sizeof(buffer), "|%.3f", v); line << buffer; }
+    for (double const v : n.rotation)    { std::snprintf(buffer, sizeof(buffer), "|%.4f", v); line << buffer; }
+    for (double const v : n.scale)       { std::snprintf(buffer, sizeof(buffer), "|%.4f", v); line << buffer; }
+    lines.push_back(line.str());
+  }
+  std::sort(lines.begin(), lines.end());
+
+  uint64_t hash = 14695981039346656037ull;
+  for (auto const& line : lines) {
+    hash = Fnv1a(line.data(), line.size(), hash);
+    hash = Fnv1a("\n", 1u, hash);
+  }
+  return "rig_" + HexString(hash, 10u);
+}
+
+tinygltf::Model MakeRigModel(std::vector<tinygltf::Node> const& nodes, std::vector<bool> keep,
+                             std::vector<int> *remap) {
+  std::vector<int> const parents = ParentIndices(nodes);
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (!keep[i]) {
+      continue;
+    }
+    size_t guard = 0;
+    for (int p = parents[i]; (p >= 0) && (guard++ < nodes.size()); p = parents[static_cast<size_t>(p)]) {
+      keep[static_cast<size_t>(p)] = true;
+    }
+  }
+
+  remap->assign(nodes.size(), -1);
+  int count = 0;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (keep[i]) {
+      (*remap)[i] = count++;
+    }
+  }
+
+  tinygltf::Model model;
+  model.asset.generator = "nif2gltf";
+  model.asset.version = "2.0";
+
+  tinygltf::Scene scene;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (!keep[i]) {
+      continue;
+    }
+    tinygltf::Node node = nodes[i];
+    node.mesh = -1;
+    node.skin = -1;
+    node.camera = -1;
+    node.extensions.clear();
+    node.children.clear();
+    for (int const child : nodes[i].children) {
+      if ((child >= 0) && (static_cast<size_t>(child) < nodes.size()) && keep[static_cast<size_t>(child)]) {
+        node.children.push_back((*remap)[static_cast<size_t>(child)]);
+      }
+    }
+    model.nodes.push_back(std::move(node));
+    if (parents[i] < 0) {
+      scene.nodes.push_back((*remap)[i]);
+    }
+  }
+  model.scenes.push_back(scene);
+  return model;
+}
+
+char const* ModelExtension() {
+  return gWriteBinary ? ".glb" : ".gltf";
+}
+
+// A GLB holds a single binary chunk : merge every buffer in the first one.
+void MergeBuffers(tinygltf::Model *model) {
+  if (model->buffers.size() <= 1u) {
+    return;
+  }
+  tinygltf::Buffer merged;
+  std::vector<size_t> base(model->buffers.size(), 0u);
+  for (size_t i = 0; i < model->buffers.size(); ++i) {
+    while (merged.data.size() % 4u != 0u) {
+      merged.data.push_back(0u);
+    }
+    base[i] = merged.data.size();
+    merged.data.insert(merged.data.end(), model->buffers[i].data.begin(), model->buffers[i].data.end());
+  }
+  for (auto &view : model->bufferViews) {
+    if ((view.buffer >= 0) && (static_cast<size_t>(view.buffer) < base.size())) {
+      view.byteOffset += base[static_cast<size_t>(view.buffer)];
+      view.buffer = 0;
+    }
+  }
+  model->buffers.clear();
+  model->buffers.push_back(std::move(merged));
+}
+
+bool WriteModel(tinygltf::Model *model, std::string const& path) {
+  if (gWriteBinary) {
+    MergeBuffers(model);
+  }
+  std::error_code ec;
+  if (auto const parent = std::filesystem::path(path).parent_path(); !parent.empty()) {
+    std::filesystem::create_directories(parent, ec);
+  }
+  tinygltf::TinyGLTF gltf;
+  return gltf.WriteGltfSceneToFile(model, path, kGLTFEmbedImages, kGLTFEmbedBuffers, gPrettyPrint, gWriteBinary);
+}
+
+// ----------------------------------------------------------------------------
+//  Manifest (JSON)
+// ----------------------------------------------------------------------------
+
+// (from tinygltf)
+using Json = nlohmann::json;
+
+Json JsonNumber(double v) { return std::isfinite(v) ? std::round(v * 1e6) / 1e6 : 0.0; }
+Json JsonPath(std::string const& s) { return s.empty() ? Json(nullptr) : Json(s); }
+
+struct ManifestInfo {
+  std::string character;      // name of the converted model
+  std::string source;         // nif file
+  std::string characterFile;  // relative path of the model's glTF
+  std::string rigId;
+  std::string skeletonFile;   // relative path (empty if not written)
+  std::string libraryFile;    // relative path (empty if not written)
+  std::vector<std::string> bones;
+  size_t numMeshes = 0u;
+  size_t numNodes = 0u;
+  float fps = 30.0f;
+  bool embedded = false;      // clips embedded in the model's glTF
+};
+
+// Each entry define a converted model, its rig and its clips.
+Json BuildManifestEntry(ManifestInfo const& info, std::vector<Clip> const& clips) {
+  Json entry = Json::object();
+
+  entry["character"] = {
+    { "name",               info.character },
+    { "source",             FileName(info.source) },
+    { "file",               JsonPath(info.characterFile) },
+    { "rig",                info.rigId },
+    { "meshes",             info.numMeshes },
+    { "nodes",              info.numNodes },
+    { "animationsEmbedded", info.embedded },
+  };
+  entry["rig"] = {
+    { "id",       info.rigId },
+    { "skeleton", JsonPath(info.skeletonFile) },
+    { "library",  JsonPath(info.libraryFile) },
+    { "bones",    info.bones },
+  };
+
+  Json jclips = Json::array();
+  for (Clip const& c : clips) {
+    double const ratio = (c.numTargets > 0u) ? static_cast<double>(c.numFound) / static_cast<double>(c.numTargets) : 0.0;
+    size_t numCubic = 0u;
+    for (ClipChannel const& ch : c.channels) {
+      numCubic += ((ch.sampler >= 0) && c.samplers[static_cast<size_t>(ch.sampler)].cubic) ? 1u : 0u;
+    }
+
+    Json textKeys = Json::array();
+    for (auto const& key : c.textKeys) {
+      textKeys.push_back({ { "time", JsonNumber(key.first) }, { "text", key.second } });
+    }
+
+    Json jc = Json::object();
+    jc["name"]          = c.name;
+    jc["sequence"]      = c.sequence;
+    jc["rig"]           = info.rigId;
+    jc["file"]          = JsonPath(c.file);
+    jc["embedded"]      = info.embedded;
+    jc["source"]        = { { "file", c.sourceFile }, { "hash", c.sourceHash } };
+    jc["duration"]      = JsonNumber(c.duration);
+    jc["fps"]           = JsonNumber(info.fps);
+    jc["cycle"]         = c.cycle;
+    jc["frequency"]     = JsonNumber(c.frequency);
+    jc["accumRoot"]     = c.accumRoot;
+    jc["accumFlags"]    = c.accumFlags;
+    jc["rootMotion"]    = c.rootMotion;
+    jc["channels"]      = c.channels.size();
+    jc["cubicChannels"] = numCubic;
+    jc["motion"]        = c.category.empty() ? Json(nullptr) : Json({ { "category", c.category }, { "ids", c.motionIds } });
+    jc["match"]         = { { "found", c.numFound }, { "total", c.numTargets }, { "ratio", JsonNumber(ratio) } };
+    jc["missing"]       = c.missing;
+    jc["textKeys"]      = textKeys;
+    jclips.push_back(std::move(jc));
+  }
+  entry["clips"] = std::move(jclips);
+  return entry;
+}
+
+// Rebuilds `<root>manifest.json` by joining the entries found in
+// `<root>manifest.d/*.json` (one per converted model, so that several runs
+// can fill the same database).
+void WriteManifestIndex(std::string const& root) {
+  namespace fs = std::filesystem;
+  std::vector<std::string> files;
+  std::error_code ec;
+  fs::directory_iterator it(root + "manifest.d", ec);
+  fs::directory_iterator const end;
+  for (; !ec && (it != end); it.increment(ec)) {
+    std::error_code ec2;
+    if (it->is_regular_file(ec2) && (it->path().extension() == ".json")) {
+      files.push_back(it->path().string());
+    }
+  }
+  std::sort(files.begin(), files.end());
+
+  Json entries = Json::array();
+  for (auto const& file : files) {
+    std::ifstream in(file, std::ios::binary);
+    // (no exception : an unreadable entry is skipped)
+    Json entry = Json::parse(in, nullptr, false);
+    if (entry.is_discarded()) {
+      DOJIMA_LOG( "[Warning] invalid manifest entry skipped : " << file );
+      continue;
+    }
+    entries.push_back(std::move(entry));
+  }
+
+  Json index = Json::object();
+  index["format"] = "nif2gltf-manifest";
+  index["version"] = 1;
+  index["entries"] = std::move(entries);
+
+  std::ofstream out(root + "manifest.json", std::ios::binary);
+  out << index.dump(2) << "\n";
+}
+
 // Convert a NiAlphaProperty to a glTF alpha mode.
 //
 // WotS4 draws characters' hair and lashes in two passes : an alpha tested one
@@ -429,6 +920,7 @@ void SetAlphaMode(Niflib::NiAlphaProperty const& prop, tinygltf::Material *mater
 int main(int argc, char *argv[]) {
   std::string nifFilename;
   bool badArguments = false;
+
   for (int i = 1; i < argc; ++i) {
     std::string const arg(argv[i]);
     if (arg == "--all-lods") {
@@ -443,6 +935,25 @@ int main(int argc, char *argv[]) {
       } else {
         badArguments = true;
       }
+    } else if ((arg == "--anim-dir") && (i + 1 < argc)) {
+      std::string const directory(argv[++i]);
+      if (CollectKeyframeFiles(directory, &gAnimFilenames) == 0u) {
+        DOJIMA_LOG( "[Warning] no .kf file found in '" << directory << "'." );
+      }
+    } else if ((arg == "--anim-filter") && (i + 1 < argc)) {
+      gAnimFilter = argv[++i];
+    } else if ((arg == "--anim-min-match") && (i + 1 < argc)) {
+      gAnimMinMatch = static_cast<float>(std::atof(argv[++i]));
+    } else if (arg == "--embed-anims") {
+      gEmbedAnims = true;
+    } else if (arg == "--split-anims") {
+      gSplitAnims = true;
+    } else if (arg == "--library") {
+      gLibraryAnims = true;
+    } else if ((arg == "--db") && (i + 1 < argc)) {
+      gDatabaseDirectory = argv[++i];
+    } else if (arg == "--no-manifest") {
+      gWriteManifest = false;
     } else if (IsKeyframeFile(arg)) {
       gAnimFilenames.push_back(arg);
     } else if (arg.compare(0, 2, "--") == 0) {
@@ -456,21 +967,55 @@ int main(int argc, char *argv[]) {
     DOJIMA_LOG( "[Error] --anim-fps must be between 1 and 240." );
     badArguments = true;
   }
+  if (!(gAnimMinMatch >= 0.0f) || !(gAnimMinMatch <= 1.0f)) {
+    DOJIMA_LOG( "[Error] --anim-min-match must be between 0 and 1." );
+    badArguments = true;
+  }
   if (nifFilename.empty() || badArguments) {
     DOJIMA_LOG( "Usage : " << std::endl
                 << argv[0] << " [options] nif_file [kf_file...]" << std::endl
                 << "  --all-lods      : keep every LOD / skinning variant of the meshes (default : only the best one)." << std::endl
                 << "  --anim kf_file  : export the animations of a keyframe file along the model" << std::endl
                 << "                    (a '.kf' file given as argument is also exported)." << std::endl
+                << "  --anim-dir dir  : export every '.kf' file found under a directory (recursively)." << std::endl
+                << "  --anim-filter s : only export the sequences whose name or file name contains 's'." << std::endl
+                << "  --anim-min-match r : skip the sequences for which less than the ratio r (0..1) of the" << std::endl
+                << "                    animated nodes exists in the model (default : 0, keep all)." << std::endl
                 << "  --anim-fps n    : sampling rate of the exported animations (default : 30)." << std::endl
                 << "  --root-motion   : keep the movement accumulated by the animations' root node" << std::endl
-                << "                    (default : the animations are played in place)." );
+                << "                    (default : the animations are played in place)." << std::endl
+                << "Where the animations go (default : --embed-anims) :" << std::endl
+                << "  --embed-anims   : all of them in the model's glTF." << std::endl
+                << "  --split-anims   : one glTF per animation (skeleton + 1 animation, no mesh), in" << std::endl
+                << "                    animations/<rig id>/. The model's glTF has no animation then." << std::endl
+                << "  --library       : one glTF with the skeleton and every animation (libraries/<rig id>.gltf)." << std::endl
+                << "Outputs :" << std::endl
+                << "  --db dir        : write into a shared directory instead of _outputs/<nif name>/ :" << std::endl
+                << "                    characters/, skeletons/, animations/, libraries/ and manifest.json" << std::endl
+                << "                    (--split-anims is implied unless --library / --embed-anims is given)." << std::endl
+                << "  --no-manifest   : do not write manifest.json (describes what is where)." );
     return EXIT_FAILURE;
   }
 
-  // Create an outputs directory for the transformed NIF file.
+  // Animations : embedded in the model unless another destination is asked for.
+  bool const useDatabase = !gDatabaseDirectory.empty();
+  if (useDatabase && !gEmbedAnims && !gLibraryAnims) {
+    gSplitAnims = true;
+  }
+  bool const embedAnims = gEmbedAnims || (!gSplitAnims && !gLibraryAnims);
+  bool const writeStandaloneClips = gSplitAnims || gLibraryAnims;
+  gDropRestChannels = !writeStandaloneClips;
+
+  // Create an outputs directory for the transformed NIF file (or the database).
   std::string const outputDirectory{
-    [](std::string const& s) -> std::string {
+    [&](std::string const& s) -> std::string {
+      if (useDatabase) {
+        std::string d = gDatabaseDirectory;
+        if (d.back() != '/' && d.back() != '\\') {
+          d += kSystemPathSeparator;
+        }
+        return d;
+      }
       return "_outputs" +
              std::string(1, kSystemPathSeparator) +
              FileStem(s) +
@@ -478,6 +1023,8 @@ int main(int argc, char *argv[]) {
     }(nifFilename)
   };
   std::filesystem::create_directories(outputDirectory);
+  std::string const characterDirectory = outputDirectory + (useDatabase ? "characters/" : "");
+  std::filesystem::create_directories(characterDirectory);
 
   // --------------
 
@@ -1723,7 +2270,12 @@ int main(int argc, char *argv[]) {
   // at a fixed rate to translation / rotation / scale channels. The nodes are
   // targeted by name, on the shared rig when it has the node, as parts hold
   // their own copies of the skeleton.
-  std::vector<tinygltf::Animation> Animations;
+  //
+  // The sampled sequences are kept as clips, which are then embedded in the
+  // model and / or written as standalone files (see below).
+  std::vector<Clip> Clips;
+  std::unordered_set<std::string> usedClipNames;
+  std::unordered_set<std::string> usedClipFiles;
   if (!gAnimFilenames.empty() && !Nodes.empty()) {
     std::unordered_map<std::string, std::vector<int>> mapNameToNodes;
     for (size_t i = 0; i < Nodes.size(); ++i) {
@@ -1739,33 +2291,6 @@ int main(int argc, char *argv[]) {
       return {};
     };
 
-    // [lambda] Create an animation accessor (not bound to a buffer view target).
-    auto addAnimAccessor{
-      [&](std::string const& name, std::vector<float> const& values, int type, size_t numComps, bool bounds) -> int {
-        size_t const count = values.size() / numComps;
-
-        tinygltf::Accessor acc;
-        acc.name = kNameAccessors ? name : "";
-        acc.bufferView = addBufferView(BufferId::VERTEX, values.data(), values.size() * sizeof(float), 0);
-        acc.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
-        acc.type = type;
-        acc.count = count;
-        if (bounds && (count > 0u)) {
-          acc.minValues.assign(numComps,  std::numeric_limits<double>::max());
-          acc.maxValues.assign(numComps, -std::numeric_limits<double>::max());
-          for (size_t i = 0; i < count; ++i) {
-            for (size_t c = 0; c < numComps; ++c) {
-              double const v = values[i * numComps + c];
-              acc.minValues[c] = std::min(acc.minValues[c], v);
-              acc.maxValues[c] = std::max(acc.maxValues[c], v);
-            }
-          }
-        }
-        Accessors.push_back(acc);
-        return static_cast<int>(Accessors.size()) - 1;
-      }
-    };
-
     for (auto const& kfFilename : gAnimFilenames) {
       kf::File kfFile;
       if (std::string error; !kf::Load(kfFilename, &kfFile, &error)) {
@@ -1773,17 +2298,32 @@ int main(int argc, char *argv[]) {
         continue;
       }
 
+      std::string const kfStem = FileStem(kfFilename);
+      std::string const kfHash = HashFile(kfFilename);
+      bool const multiSequence = (kfFile.sequences.size() > 1u);
+
       size_t numChannels = 0;
       size_t numPlayed = 0;
       std::unordered_set<std::string> missingTargets;
       std::unordered_set<std::string> unsupportedEvaluators;
 
       for (auto const& seq : kfFile.sequences) {
-        tinygltf::Animation anim;
-        anim.name = seq.name.empty() ? FileStem(kfFilename) : seq.name;
+        std::string const seqName = seq.name.empty() ? kfStem : seq.name;
+        if (!gAnimFilter.empty() && (kfStem.find(gAnimFilter) == std::string::npos) &&
+            (seqName.find(gAnimFilter) == std::string::npos)) {
+          continue;
+        }
 
-        std::vector<float> const times = MakeSampleTimes(seq.duration, gAnimFps);
-        int timeAccessor = -1; // (created along the first channel)
+        // (several sequences in a file : the file name prefixes them, as they
+        //  are often generic, e.g. the facial expressions)
+        Clip clip;
+        clip.sequence = seqName;
+        clip.name = UniqueName(multiSequence ? (kfStem + "__" + seqName) : seqName, &usedClipNames);
+        clip.fileStem = UniqueName(SanitizeName(clip.name), &usedClipFiles);
+        clip.sourceFile = FileName(kfFilename);
+        clip.sourceHash = kfHash;
+        clip.times = MakeSampleTimes(seq.duration, gAnimFps);
+        std::vector<float> const& times = clip.times;
 
         // Each (node, path) can be targeted only once by an animation.
         std::unordered_set<std::string> targeted;
@@ -1793,29 +2333,26 @@ int main(int argc, char *argv[]) {
                                int type, size_t numComps, auto const& isRestValue) -> void {
           int sampler = -1;
           for (int const nodeIndex : nodes) {
-            if (isRestValue(Nodes[nodeIndex])) {
+            if (gDropRestChannels && isRestValue(Nodes[nodeIndex])) {
               continue;
             }
             if (!targeted.insert(std::to_string(nodeIndex) + path).second) {
-              DOJIMA_QUIET_LOG( "[Warning] " << anim.name << " : '" << Nodes[nodeIndex].name << "' has several " << path << " channels." );
+              DOJIMA_QUIET_LOG( "[Warning] " << clip.name << " : '" << Nodes[nodeIndex].name << "' has several " << path << " channels." );
               continue;
             }
             if (sampler < 0) {
-              if (timeAccessor < 0) {
-                timeAccessor = addAnimAccessor("TIME", times, TINYGLTF_TYPE_SCALAR, 1, true);
-              }
-              tinygltf::AnimationSampler s;
-              s.input = timeAccessor;
-              s.output = addAnimAccessor(path, values, type, numComps, false);
-              s.interpolation = "LINEAR";
-              anim.samplers.push_back(s);
-              sampler = static_cast<int>(anim.samplers.size()) - 1;
+              ClipSampler s;
+              s.type = type;
+              s.numComps = numComps;
+              s.values = values;
+              clip.samplers.push_back(std::move(s));
+              sampler = static_cast<int>(clip.samplers.size()) - 1;
             }
-            tinygltf::AnimationChannel channel;
+            ClipChannel channel;
+            channel.node = nodeIndex;
+            channel.path = path;
             channel.sampler = sampler;
-            channel.target_node = nodeIndex;
-            channel.target_path = path;
-            anim.channels.push_back(channel);
+            clip.channels.push_back(std::move(channel));
           }
         };
 
@@ -1834,11 +2371,14 @@ int main(int argc, char *argv[]) {
         constexpr float kEpsilon = 1e-5f;
 
         for (auto const& evaluator : seq.evaluators) {
+          ++clip.numTargets;
           auto const targets = findTargets(evaluator.target);
           if (targets.empty()) {
             missingTargets.insert(evaluator.target);
+            clip.missing.push_back(evaluator.target);
             continue;
           }
+          ++clip.numFound;
           bool const isAccumRoot = (evaluator.target == seq.accumRoot);
           std::vector<float> values;
 
@@ -1915,33 +2455,32 @@ int main(int argc, char *argv[]) {
         }
         unsupportedEvaluators.insert(seq.unsupported.begin(), seq.unsupported.end());
 
-        if (anim.channels.empty()) {
-          DOJIMA_LOG( "[Warning] " << kfFilename << " : sequence '" << anim.name << "' has no channel matching the model." );
+        if (clip.channels.empty()) {
+          DOJIMA_LOG( "[Warning] " << kfFilename << " : sequence '" << seqName << "' has no channel matching the model." );
+          continue;
+        }
+        if (double const match = (clip.numTargets > 0u) ? static_cast<double>(clip.numFound) / static_cast<double>(clip.numTargets) : 0.0;
+            match < static_cast<double>(gAnimMinMatch)) {
+          DOJIMA_LOG( "[Warning] " << kfFilename << " : sequence '" << seqName << "' skipped, only " << clip.numFound
+                      << " of its " << clip.numTargets << " animated nodes are in the model." );
           continue;
         }
 
-        // Keep the playback informations of the game, as glTF has no equivalent.
-        // [TODO: extract as custom file / json ?]
-        tinygltf::Value::Array textKeys;
+        // Keep the playback informations of the original file as glTF has no equivalent
+        // (they are in the animation's extras, and in the manifest).
+        clip.duration = seq.duration;
+        clip.frequency = seq.frequency;
+        clip.cycle = CycleTypeName(seq.cycle);
+        clip.accumRoot = seq.accumRoot;
+        clip.accumFlags = seq.accumFlags;
+        clip.rootMotion = gKeepRootMotion;
         for (auto const& key : seq.textKeys) {
-          textKeys.push_back(tinygltf::Value(tinygltf::Value::Object{
-            { "time", tinygltf::Value(static_cast<double>(key.time)) },
-            { "text", tinygltf::Value(key.text) },
-          }));
+          clip.textKeys.emplace_back(key.time, key.text);
         }
-        anim.extras = tinygltf::Value(tinygltf::Value::Object{
-          { "cycle",       tinygltf::Value(std::string(CycleTypeName(seq.cycle))) },
-          { "duration",    tinygltf::Value(static_cast<double>(seq.duration)) },
-          { "frequency",   tinygltf::Value(static_cast<double>(seq.frequency)) },
-          { "accumRoot",   tinygltf::Value(seq.accumRoot) },
-          { "accumFlags",  tinygltf::Value(static_cast<int>(seq.accumFlags)) },
-          { "rootMotion",  tinygltf::Value(gKeepRootMotion) },
-          { "textKeys",    tinygltf::Value(textKeys) },
-        });
 
-        numChannels += anim.channels.size();
+        numChannels += clip.channels.size();
         ++numPlayed;
-        Animations.push_back(std::move(anim));
+        Clips.push_back(std::move(clip));
       }
 
       DOJIMA_LOG( kfFilename << " : " << numPlayed << " animation(s) exported (" << numChannels << " channels, "
@@ -1967,8 +2506,7 @@ int main(int argc, char *argv[]) {
     data.asset.version = "2.0";
 
     data.accessors    = std::move( Accessors );
-    data.animations   = std::move( Animations );
-    data.buffers      = std::move( Buffers );
+    data.buffers     = std::move( Buffers );
     data.bufferViews  = std::move( BufferViews );
     data.materials    = std::move( Materials );
     data.meshes       = std::move( Meshes );
@@ -1995,12 +2533,124 @@ int main(int argc, char *argv[]) {
     }(nifFilename, kGLTFWriteBinary ? "glb" : "gltf")
   };
 
-  if (tinygltf::TinyGLTF gltf; !gltf.WriteGltfSceneToFile(
-      &data, outputDirectory + gltfFilename, kGLTFEmbedImages, kGLTFEmbedBuffers, kGLTFPrettyPrint, kGLTFWriteBinary
-    ))
-  {
+  // -- Rig (the bones and their ancestors), identified by its content.
+  std::vector<int> rigIndices;
+  if (!mapRigNameToNode.empty()) {
+    for (auto const& [name, index] : mapRigNameToNode) {
+      rigIndices.push_back(index);
+    }
+  } else {
+    // (no skinning : every node which is not a mesh)
+    for (size_t i = 0; i < data.nodes.size(); ++i) {
+      if (data.nodes[i].mesh < 0) {
+        rigIndices.push_back(static_cast<int>(i));
+      }
+    }
+  }
+  std::sort(rigIndices.begin(), rigIndices.end());
+  std::string const rigId = ComputeRigId(data.nodes, rigIndices);
+  std::vector<std::string> rigBones;
+  for (int const index : rigIndices) {
+    rigBones.push_back(data.nodes[static_cast<size_t>(index)].name);
+  }
+  std::sort(rigBones.begin(), rigBones.end());
+
+  // -- Animations.
+  std::vector<Clip const*> allClips;
+  for (auto const& clip : Clips) {
+    allClips.push_back(&clip);
+  }
+
+  // Embedded in the model.
+  if (embedAnims) {
+    AppendClips(&data, allClips, std::vector<int>());
+  }
+
+  // Standalone : skeleton alone, one clip per file, and / or all the clips together.
+  // Only the rig's nodes are kept, the channels of the other nodes are dropped.
+  std::string skeletonFile;
+  std::string libraryFile;
+  if (writeStandaloneClips && !data.nodes.empty()) {
+    std::vector<bool> keep(data.nodes.size(), false);
+    for (int const index : rigIndices) {
+      keep[static_cast<size_t>(index)] = true;
+    }
+    std::vector<int> remap;
+    tinygltf::Model const skeleton = MakeRigModel(data.nodes, keep, &remap);
+
+    {
+      tinygltf::Model m = skeleton;
+      std::string const file = "skeletons/" + rigId + ".gltf";
+      if (WriteModel(&m, outputDirectory + file)) {
+        skeletonFile = file;
+      } else {
+        DOJIMA_LOG( "[Error] cannot write " << file );
+      }
+    }
+
+    if (gSplitAnims) {
+      size_t numWritten = 0;
+      for (Clip &clip : Clips) {
+        tinygltf::Model m = skeleton;
+        AppendClips(&m, { &clip }, remap);
+        if (m.animations.empty()) {
+          DOJIMA_LOG( "[Warning] " << clip.name << " : no channel on the rig, not written." );
+          continue;
+        }
+        std::string const file = "animations/" + rigId + "/" + clip.fileStem + ".gltf";
+        if (WriteModel(&m, outputDirectory + file)) {
+          clip.file = file;
+          ++numWritten;
+        } else {
+          DOJIMA_LOG( "[Error] cannot write " << file );
+        }
+      }
+      DOJIMA_LOG( numWritten << " standalone animation(s) written in " << outputDirectory << "animations/" << rigId << "/" );
+    }
+
+    if (gLibraryAnims && !allClips.empty()) {
+      tinygltf::Model m = skeleton;
+      AppendClips(&m, allClips, remap);
+      std::string const file = "libraries/" + rigId + ".gltf";
+      if (WriteModel(&m, outputDirectory + file)) {
+        libraryFile = file;
+        DOJIMA_LOG( "Animation library written : " << outputDirectory << file );
+      } else {
+        DOJIMA_LOG( "[Error] cannot write " << file );
+      }
+    }
+  }
+
+  // -- Model.
+  std::string const characterFile = (useDatabase ? "characters/" : "") + gltfFilename;
+  if (!WriteModel(&data, outputDirectory + characterFile)) {
     DOJIMA_LOG( "[Error] glTF file writing failed." );
     return EXIT_FAILURE;
+  }
+
+  // -- Manifest.
+  if (gWriteManifest) {
+    ManifestInfo info;
+    info.character = FileStem(nifFilename);
+    info.source = nifFilename;
+    info.characterFile = characterFile;
+    info.rigId = rigId;
+    info.skeletonFile = skeletonFile;
+    info.libraryFile = libraryFile;
+    info.bones = rigBones;
+    info.numMeshes = data.meshes.size();
+    info.numNodes = data.nodes.size();
+    info.fps = gAnimFps;
+    info.embedded = embedAnims;
+
+    std::error_code ec;
+    std::filesystem::create_directories(outputDirectory + "manifest.d", ec);
+    {
+      std::ofstream out(outputDirectory + "manifest.d/" + SanitizeName(info.character) + ".json", std::ios::binary);
+      out << BuildManifestEntry(info, Clips);
+    }
+    WriteManifestIndex(outputDirectory);
+    DOJIMA_LOG( "Manifest : " << outputDirectory << "manifest.json" );
   }
 
   return EXIT_SUCCESS;
