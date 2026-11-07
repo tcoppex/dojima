@@ -16,7 +16,7 @@
 - [x] float16 buffers (*Maps, Items, Accessories & Weapons*)
 - [x] materials
 - [x] skinning
-- [x] keyframe animations
+- [x] animations
 
 ##### WotS3
 
@@ -28,17 +28,14 @@
 ```bash
 # Clone the project.
 git clone https://github.com/tcoppex/dojima
+cd dojima
 
 # Compile using Ninja as generator (optional).
-cmake dojima -B BUILD/dojima -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build BUILD/dojima
+cmake -B BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build BUILD
 
 # Run the cli converter.
-#./dojima/bin/nif2gltf $WOTS4_PATH/Common/Character/Model/Pack/Dojima01.nif
-
-# By default only the best LOD (LV1) of each character part is exported,
-# use --all-lods to keep them all.
-#./dojima/bin/nif2gltf --all-lods Dojima01.nif
+#./bin/nif2gltf $WOTS4_PATH/Common/Character/Model/Pack/Dojima01.nif
 ```
 
 ### Acknowledgment
