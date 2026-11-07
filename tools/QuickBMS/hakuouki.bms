@@ -1,0 +1,47 @@
+# -----------------------------------------------------------------------------
+#
+# QuickBMS script to unpack volume.dat, as used in the PS2 version of
+# "Way Of The Samurai" 1 and 2.
+#
+# FLAGS 0,1 : data = SIZE bytes.
+# FLAGS 2,4 : SIZE is the unpacked size, stored bytes end at NAME_OFF (packed, format unknown).
+#
+# -----------------------------------------------------------------------------
+
+# Hakuoki Shinsengumi Kitan / Way of the Samurai 1 and 2 (script 0.2.0)
+# script for QuickBMS http://quickbms.aluigi.org
+
+endian big
+idstring "\xfa\xde\xba\xbe"
+get NUM long
+get FILES long
+get DATA_OFF long
+get DATA_SIZE long
+for i = 0 < FILES
+    get NAME_HASH long
+    get OFFSET long
+    get SIZE long
+    get FLAGS long
+
+    get NAME_OFF long
+    get NAMESZ long
+
+    math OFFSET   + DATA_OFF
+    math NAME_OFF + DATA_OFF
+
+    savepos TMP
+    goto NAME_OFF
+    getdstring NAME NAMESZ
+    goto TMP
+
+    if FLAGS == 0
+        log NAME OFFSET SIZE
+    elif FLAGS == 1
+        log NAME OFFSET SIZE
+    else
+        math XSIZE = NAME_OFF
+        math XSIZE - OFFSET
+        string NAME + ".packed"
+        log NAME OFFSET XSIZE
+    endif
+next i
